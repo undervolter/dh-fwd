@@ -104,7 +104,7 @@ func TestParseTouErrors(t *testing.T) {
 }
 
 func TestBuildDHRequestShape(t *testing.T) {
-	req := string(buildDHRequest("DHPOST", "/tcprelay/client-bind", `{"Token":"T1"}`, true, 42))
+	req := string(buildDHRequest("DHPOST", "/tcprelay/client-bind", `{"Token":"T1"}`, true, 42, smartpssProfile, "", false))
 	if !bytes.HasPrefix([]byte(req), []byte("DHPOST /tcprelay/client-bind HTTP/1.1\r\nCSeq: 42\r\n")) {
 		t.Fatalf("request line/cseq wrong: %q", req)
 	}

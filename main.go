@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"sort"
 	"strconv"
@@ -174,6 +175,7 @@ func main() {
 	var threads int
 	var portSpec string
 	var hbTimeout time.Duration
+	var appName string
 
 	flag.BoolVar(&debug, "debug", false, "debug protocol output")
 	flag.BoolVar(&debug, "d", false, "debug protocol output")
@@ -201,6 +203,7 @@ func main() {
 	flag.BoolVar(&logRetries, "lr", false, "log retry details")
 	flag.DurationVar(&hbTimeout, "heartbeat-timeout", 10*time.Second, "PTCP heartbeat timeout")
 	flag.DurationVar(&hbTimeout, "hb", 10*time.Second, "PTCP heartbeat timeout")
+	flag.StringVar(&appName, "app", "smartpss", "application profile: smartpss (default) or dmss — picks the cloud host, app credentials and request dialect (dmss for devices bound via the DMSS app)")
 	flag.Usage = usage
 
 	positional, err := parseArgs(flag.CommandLine, os.Args[1:])
@@ -210,6 +213,12 @@ func main() {
 
 	HEARTBEAT_TIMEOUT = hbTimeout
 
+	prof, err := profileByName(appName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
 	if len(positional) < 1 {
 		flag.Usage()
 		os.Exit(1)
@@ -217,7 +226,7 @@ func main() {
 	serial := positional[0]
 
 	if infoMode {
-		os.Exit(queryDeviceInfo(serial, debug))
+		os.Exit(queryDeviceInfo(serial, prof, debug))
 	}
 
 	if dtype > 0 && (username == "" || password == "") {
@@ -245,9 +254,9 @@ func main() {
 	})
 
 	if multi {
-		runMulti(serial, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
+		runMulti(serial, prof, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
 	} else {
-		runSingle(serial, specs[0], dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
+		runSingle(serial, prof, specs[0], dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
 	}
 }
 
@@ -266,12 +275,18 @@ General:
                                   local ports (DVRIP + web/API channels)
   --pool, --pools <n>             pre-bound realms per forwarded port
                                   (default 50; 0 disables pooling)
+  --app <smartpss|dmss>           application profile (default smartpss):
+                                  cloud host + app credentials + request
+                                  dialect — dmss for devices bound through
+                                  the DMSS app (Dolynk cloud)
 
 Device auth:
   --type, -t <0|1>        device type: 0 = no auth (default), 1 = with auth
   --username, -u <name>   username (required when --type 1)
   --password, -P <pass>   password (required when --type 1)
   --randsalt, -s <salt>   RandSalt from the info blob
+                          (not needed with --app dmss — the salt is read
+                          from the device's encrypted Info blob)
 
 Ports:
   --port, -p <spec>       "local:camera" pairs, e.g. "5080,5081:80,81";
@@ -284,6 +299,7 @@ Examples:
   dh-fwd SN -p 5080,5081:80,81
   dh-fwd SN -t 1 -u admin -P undervolter -p 5080:554
   dh-fwd SN -p 1337:80 --pool 50
+  dh-fwd --app dmss SN -t 1 -u admin -P secret -p 8554:554
 `)
 }
 
@@ -389,9 +405,9 @@ func makePortSpecs(locals, remotes []int) ([]PortSpec, error) {
 	return specs, nil
 }
 
-func runSingle(serial string, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
+func runSingle(serial string, prof *appProfile, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{spec}}
-	t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, nil)
+	t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, nil)
 	cp := NewConnectProgress(os.Stdout, serial, spec.Remote)
 	t.progress = cp
 	runWithRetries(t, cp, func(err error) {
@@ -404,34 +420,75 @@ func runSingle(serial string, spec PortSpec, dtype int, username, password, rand
 }
 
 // verifyDevice performs a lightweight existence check (and, for Type 1, a
-// full auth round-trip) before spawning parallel tunnels in multi mode.
-func verifyDevice(serial string, dtype int, username, password, randsalt string, debug bool) bool {
-	u := NewUDP(MAIN_SERVER, MAIN_PORT, debug)
+// full auth round-trip) before spawning parallel tunnels in multi mode. It
+// drives the same logical channel exchange as the tunnel handshake
+// (channelSender): the AutoSalt is resolved from the device's Info blob
+// first, ClientId advertises a real forwarded port, the request travels
+// under its own CSeq / x-pcs-request-id with the profile's retransmission
+// behavior. The resolved salt is returned so every per-port tunnel reuses
+// it instead of re-deriving it.
+func verifyDevice(serial string, prof *appProfile, dtype int, username, password, randsalt string, specs []PortSpec, debug bool) (bool, string) {
+	logf := func(format string, args ...any) {
+		if debug {
+			fmt.Printf(format+"\n", args...)
+		}
+	}
+	u := NewUDP(prof.mainServer, prof.mainPort, debug, prof)
 	defer u.Close()
-	u.Request("/probe/p2psrv", "", true, true)
+	u.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
 	res, err := u.Request(fmt.Sprintf("/online/p2psrv/%s", serial), "", true, true)
 	if err != nil {
-		return false
+		return false, randsalt
 	}
 	if res == nil || res.Code >= 400 {
-		return false
+		return false, randsalt
 	}
 	if res.Body["body/US"] == "" {
-		return false
+		return false, randsalt
 	}
 
+	if prof.autoSalt && dtype > 0 && randsalt == "" {
+		// Only profiles that resolve the salt from the device dial the US
+		// here; the legacy preflight talks to the main server alone.
+		us, portStr, err := net.SplitHostPort(res.Body["body/US"])
+		if err != nil {
+			logf("malformed US address %q — skipping the Info-blob salt", res.Body["body/US"])
+			return false, randsalt
+		}
+		usPort, _ := strconv.Atoi(portStr)
+		v := NewUDP(us, usPort, debug, prof)
+		salt, err := resolveAutoSalt(prof, dtype, randsalt, probeDeviceInfo(v, serial), logf)
+		v.Close()
+		if err != nil {
+			// AutoSalt is required here and the blob was unusable: the
+			// channel request cannot be signed — the device is unverifiable.
+			logf("%v — treating the device as unreachable", err)
+			return false, randsalt
+		}
+		randsalt = salt
+	}
+
+	fwdPort := 0
+	if len(specs) > 0 {
+		fwdPort = specs[0].Remote
+	}
 	aid := make([]byte, 8)
 	rand.Read(aid)
-	body, _ := p2pChannelBody(u.lport, dtype, username, password, randsalt, aid)
-	u.Request(fmt.Sprintf("/device/%s/p2p-channel", serial), body, true, false)
+	ch := newChannelSender(u, serial, prof, dtype, username, password, randsalt, u.lport, fwdPort, aid)
+	ch.send(false)
+	if prof.channelRetransmit {
+		if early := waitChannelEarlyAck(u, ch, logf, channelAckWindow); early != nil {
+			return early.Code < 400, randsalt
+		}
+	}
 	res, err = u.Read(true, RELAY_READ_TIMEOUT)
 	if err == nil && res.Code < 200 {
 		res, err = u.Read(true, RELAY_READ_TIMEOUT)
 	}
 	if err != nil {
-		return false
+		return false, randsalt
 	}
-	return res.Code < 400
+	return res.Code < 400, randsalt
 }
 
 func distribute(specs []PortSpec, threads int) []specGroup {
@@ -444,11 +501,15 @@ func distribute(specs []PortSpec, threads int) []specGroup {
 	return groups
 }
 
-func runMulti(serial string, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
-	if !verifyDevice(serial, dtype, username, password, randsalt, debug) {
+func runMulti(serial string, prof *appProfile, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
+	ok, salt := verifyDevice(serial, prof, dtype, username, password, randsalt, specs, debug)
+	if !ok {
 		deviceNotFound(serial)
 		os.Exit(1)
 	}
+	// The preflight may have resolved the salt from the device's Info blob
+	// (DMSS profile) — all tunnels below reuse it, no per-port re-derivation.
+	randsalt = salt
 
 	ui := NewUI(os.Stdout)
 	ui.Start(fmt.Sprintf("Opening %d ports on %s | Threads: %d", len(specs), serial, threads), len(specs))
@@ -459,7 +520,7 @@ func runMulti(serial string, specs []PortSpec, threads int, dtype int, username,
 		if len(g.idxs) == 0 {
 			continue
 		}
-		t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
+		t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
 		for _, idx := range g.idxs {
 			live.Store(idx, t)
 		}
@@ -500,7 +561,7 @@ func runMulti(serial string, specs []PortSpec, threads int, dtype int, username,
 				for _, f := range fails {
 					reg.connecting(f.idx)
 					g := specGroup{idxs: []int{f.idx}, specs: []PortSpec{f.spec}}
-					t := newTunnel(serial, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
+					t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
 					live.Store(f.idx, t)
 					go runWithRetries(t, nil, nil)
 				}

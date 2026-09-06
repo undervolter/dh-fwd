@@ -28,6 +28,18 @@ var (
 	RELAY_READ_TIMEOUT = 15 * time.Second
 )
 
+// Bounded reads for the best-effort relay-dispatcher exchange
+// (relayAgentOptional profiles only — see profile.go). The dispatcher handed
+// out by /online/relay can be dead (live 2026-09-06: the Dolynk relay
+// dispatcher at 46.243.143.136:8900 answered /relay/agent with silence,
+// 17 s × 3), and the DMSS app never allocates the agent at all, so both
+// reads get a short ceiling instead of RELAY_READ_TIMEOUT. Vars like
+// localChannelAckTimeout so tests can shrink them.
+var (
+	relayLookupTimeout = 3 * time.Second
+	relayAgentTimeout  = 3 * time.Second
+)
+
 var errDeviceNotFound = errors.New("device response: code=404 Not Found")
 
 var notFoundPrinted sync.Once
@@ -120,15 +132,17 @@ type specGroup struct {
 // PTCP session, and the local TCP listeners multiplexed over it.
 type Tunnel struct {
 	serial, username, password, randsalt string
+	chanKey                              []byte // Type-1 channel key, for the post-establishment local-channel step
 	dtype                                int
+	profile                              *appProfile
 	debug                                bool
 	logRetries                           bool
 	useTCP                               bool // force TCP-relay data path
 
-	specs   []PortSpec
-	specIdx []int
-	reg     *PortRegistry
-	ui      *UI
+	specs    []PortSpec
+	specIdx  []int
+	reg      *PortRegistry
+	ui       *UI
 	progress *ConnectProgress // non-nil only in single-port mode
 
 	deviceRemote *UDP
@@ -161,17 +175,24 @@ type Tunnel struct {
 	poolTarget int
 }
 
-
 // poolState is the per-port pool. All fields guarded by poolMu.
 type poolState struct {
 	queue    []uint32
 	inflight int
 }
 
-func newTunnel(serial string, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, g specGroup, reg *PortRegistry) *Tunnel {
+func newTunnel(serial string, prof *appProfile, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, g specGroup, reg *PortRegistry) *Tunnel {
+	// The app relay dialect binds each realm FRESH, seconds before use
+	// (capture: BIND → 0x12 CONN → DATA, ~6 ms apart). Pre-bound realms go
+	// stale device-side and their DATA is discarded, so pooling is disabled
+	// for noRelayAuth profiles regardless of --pool.
+	if prof != nil && prof.noRelayAuth && poolSize > 0 {
+		poolSize = 0
+	}
 	t := &Tunnel{
 		serial:      serial,
 		dtype:       dtype,
+		profile:     prof,
 		username:    username,
 		password:    password,
 		randsalt:    randsalt,
@@ -207,6 +228,7 @@ func (t *Tunnel) reset() {
 	t.useTCPPath = false
 	t.socksMu.Unlock()
 	t.primary = nil
+	t.chanKey = nil
 	t.bindWait = make(map[uint32]chan struct{})
 	t.pools = make(map[int]*poolState)
 	t.failErr = nil
@@ -279,38 +301,263 @@ func (t *Tunnel) markConnecting() {
 	}
 }
 
-// p2pChannelBody builds the /device/<SN>/p2p-channel XML body: Identify (8
-// random bytes space-separated), IpEncrpt flag, and (Type 1) the signed and
-// encrypted auth block.
-func p2pChannelBody(lport, dtype int, username, password, randsalt string, aid []byte) (string, []byte) {
-	laddr := fmt.Sprintf("127.0.0.1:%d", lport)
-	ipaddr := fmt.Sprintf("<IpEncrpt>true</IpEncrpt><LocalAddr>%s</LocalAddr>", laddr)
-	authStr := ""
-	var key []byte
-	if dtype > 0 {
-		key = getDeriveKey(username, password, randsalt)
-		encNonce := getNonce()
-		encLaddr := getEnc(key, encNonce, laddr)
-		ipaddr = fmt.Sprintf("<IpEncrptV2>true</IpEncrptV2><LocalAddr>%s</LocalAddr>", encLaddr)
-		authStr = getAuth(username, key, encNonce, laddr, randsalt)
-	}
+// channelRequest is one logical /device/<SN>/p2p-channel exchange. The
+// identity fields — CSeq, x-pcs-request-id, Identify, CreateDate, ClientId,
+// RandSalt — are fixed at construction; every (re)send refreshes the crypto
+// fields — Nonce, DevAuth, encrypted LocalAddr (and the WSSE digest, which
+// buildDHRequest regenerates per datagram) — via regenerate(). This mirrors
+// the DMSS app's retransmission behavior (capture: ~550 ms re-sends;
+// spike/README.md §"DMSS profile").
+type channelRequest struct {
+	prof *appProfile
 
-	aidHex := make([]string, 8)
-	for i, b := range aid {
-		aidHex[i] = fmt.Sprintf("%x", b)
-	}
+	dtype    int
+	username string
+	key      []byte // Type-1 master key (nil for Type 0)
+	randsalt string
 
-	body := fmt.Sprintf("<body>%s<Identify>%s</Identify>%s<version>5.0.0</version></body>",
-		authStr, strings.Join(aidHex, " "), ipaddr)
-	return body, key
+	lport int // local UDP port encrypted into LocalAddr
+
+	bindIP       string   // egress IP toward the p2p server (final LocalAddr entry)
+	addrPrefixes []string // interface IPv4s (leading bare-IP LocalAddr entries)
+
+	cseq     uint32
+	pcsID    string // x-pcs-request-id (DMSS only, else "")
+	identify string // 8 bytes, space-separated hex
+	created  int64  // CreateDate (unix seconds; fixed per logical request)
+	clientID string // "<32 hex>:<fwdPort>" (DMSS only, else "")
+
+	nonce    int
+	laddrEnc string // LocalAddr ciphertext the DevAuth signature covers
 }
 
-// handshake runs the full 4-phase connection: cloud discovery, relay agent
+// newChannelRequest builds one logical channel request and derives its
+// first crypto generation. bindIP is the socket's egress IP toward the p2p
+// server (UDP.bindIP) — the final LocalAddr entry; the interface prefixes
+// are enumerated once here so every (re)send signs the same address list.
+func newChannelRequest(prof *appProfile, dtype int, username, password, randsalt string, aid []byte, bindIP string, lport, fwdPort int) *channelRequest {
+	cr := &channelRequest{
+		prof:         prof,
+		dtype:        dtype,
+		username:     username,
+		randsalt:     randsalt,
+		bindIP:       bindIP,
+		addrPrefixes: localAddrPrefixes(bindIP),
+		lport:        lport,
+		// Profile dialect: global counter for smartpss, random signed
+		// int32 for dmss (app parity; live-proven wire shape). Allocated
+		// once — retransmissions replay this exact value.
+		cseq:     nextCSeqFor(prof),
+		identify: identifyHex(aid, prof),
+		created:  time.Now().Unix(),
+	}
+	if prof.pcsRequestID {
+		cr.pcsID = randomHex(16)
+		cr.clientID = fmt.Sprintf("%s:%d", randomHex(16), fwdPort)
+	}
+	if dtype > 0 {
+		cr.key = getDeriveKey(username, password, randsalt)
+	}
+	cr.regenerate()
+	return cr
+}
+
+// identifyHex renders the 8 aid bytes as space-separated hex. The DMSS app
+// zero-pads each byte to two digits; dh-fwd's legacy smartpss format is
+// unpadded — kept byte-for-byte for the default profile.
+func identifyHex(aid []byte, prof *appProfile) string {
+	parts := make([]string, len(aid))
+	for i, b := range aid {
+		format := "%x"
+		if prof.extendedBody {
+			format = "%02x"
+		}
+		parts[i] = fmt.Sprintf(format, b)
+	}
+	return strings.Join(parts, " ")
+}
+
+// localAddrPrefixes enumerates this host's IPv4 addresses for the LocalAddr
+// CSV's bare-IP prefix entries: loopback, IPv4 link-local (169.254.0.0/16)
+// and the bind IP itself are skipped — the bind is always appended as the
+// final host:port entry, so advertising it twice as a prefix would only
+// bloat the payload. Order follows net.Interfaces().
+func localAddrPrefixes(bindIP string) []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, ifc := range ifaces {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil || ip4.IsLoopback() || ip4.IsLinkLocalUnicast() || ip4.IsUnspecified() {
+				continue
+			}
+			if s := ip4.String(); s != bindIP {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
+}
+
+// buildLocalAddr renders the LocalAddr payload the way the DMSS app emits
+// it: a comma-separated list of bare-IP interface prefixes followed by the
+// final "bindIP:port" entry. This is the DMSS app's wire form, kept for app
+// parity: the earlier "single-entry → 403" live bracket (2026-09-06) ran
+// with dh-fwd's header serialization and is confounded — later live
+// evidence showed the header serialization was the discriminator, not the
+// LocalAddr shape. At least one prefix is mandatory; when the host exposes
+// no other IPv4, the bind IP doubles as the prefix (the duplicate is
+// parse-safe).
+func buildLocalAddr(prefixes []string, bindIP string, lport int) string {
+	last := bindIP + ":" + strconv.Itoa(lport)
+	if len(prefixes) == 0 {
+		return bindIP + "," + last
+	}
+	return strings.Join(prefixes, ",") + "," + last
+}
+
+// localAddr renders the plaintext LocalAddr encrypted into the request:
+// the app-format CSV (buildLocalAddr) of this socket's addresses.
+func (cr *channelRequest) localAddr() string {
+	return buildLocalAddr(cr.addrPrefixes, cr.bindIP, cr.lport)
+}
+
+// regenerate refreshes the per-send crypto fields (Nonce + the encrypted
+// LocalAddr the DevAuth signature covers) while keeping the logical identity
+// fixed — fresh crypto, same request.
+func (cr *channelRequest) regenerate() {
+	cr.nonce = getNonce()
+	if cr.dtype > 0 {
+		cr.laddrEnc = getEnc(cr.key, cr.nonce, cr.localAddr())
+	}
+}
+
+// body renders the p2p-channel XML for the current crypto generation.
+// The DevAuth signature covers the ENCRYPTED LocalAddr string (dh-p2p
+// PR#29/#33, verified against captured traffic on fw 6.7.30) for both
+// profiles — signing the plaintext was dh-fwd's Type-1 bug.
+func (cr *channelRequest) body() string {
+	encryptTag := "<IpEncrpt>true</IpEncrpt>"
+	laddr := fmt.Sprintf("<LocalAddr>%s</LocalAddr>", cr.localAddr())
+	authStr := ""
+	if cr.dtype > 0 {
+		encryptTag = "<IpEncrptV2>true</IpEncrptV2>"
+		laddr = fmt.Sprintf("<LocalAddr>%s</LocalAddr>", cr.laddrEnc)
+		authStr = getAuthAt(cr.username, cr.key, cr.nonce, cr.laddrEnc, cr.randsalt, cr.created)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("<body>")
+	sb.WriteString(authStr)
+	fmt.Fprintf(&sb, "<Identify>%s</Identify>", cr.identify)
+	sb.WriteString(encryptTag)
+	if cr.prof.extendedBody {
+		// DMSS capture element order: LocalAddr sits between <sVersion>
+		// and <Pid>, not next to the encryption tag.
+		fmt.Fprintf(&sb,
+			"<NatValueT>0</NatValueT><version>%s</version><sVersion>%s</sVersion>",
+			cr.prof.version, cr.prof.sversion)
+		sb.WriteString(laddr)
+		fmt.Fprintf(&sb, "<Pid>0</Pid><ClientId>%s</ClientId>", cr.clientID)
+	} else {
+		// Legacy smartpss position: right after the encryption tag.
+		sb.WriteString(laddr)
+		sb.WriteString("<version>5.0.0</version>")
+	}
+	sb.WriteString("</body>")
+	return sb.String()
+}
+
+// channelSender binds one logical channelRequest to the socket and path it
+// travels on. Both the tunnel handshake and the multi-mode preflight
+// (verifyDevice) go through it, so the preflight exercises the full DMSS
+// channel machinery: AutoSalt already resolved, ClientId advertising a real
+// forwarded port, x-pcs-request-id on the wire and app-style retransmission.
+type channelSender struct {
+	req  *channelRequest
+	u    *UDP
+	path string
+}
+
+// newChannelSender builds one logical channel request and binds it to u.
+// The request allocates its CSeq once, at construction; the socket's egress
+// IP (u.bindIP, resolved toward the p2p server at socket creation) becomes
+// the final LocalAddr entry, and fwdPort is the representative forwarded
+// camera port advertised in ClientId (DMSS).
+func newChannelSender(u *UDP, serial string, prof *appProfile, dtype int, username, password, randsalt string, lport, fwdPort int, aid []byte) *channelSender {
+	return &channelSender{
+		req:  newChannelRequest(prof, dtype, username, password, randsalt, aid, u.bindIP, lport, fwdPort),
+		u:    u,
+		path: fmt.Sprintf("/device/%s/p2p-channel", serial),
+	}
+}
+
+// send puts one generation of the request on the wire under the request's
+// own identity — its CSeq and x-pcs-request-id — so retransmissions stay the
+// same logical request; retransmit refreshes the crypto fields first.
+func (cs *channelSender) send(retransmit bool) {
+	if retransmit {
+		cs.req.regenerate()
+	}
+	cs.u.RequestEx(cs.path, cs.req.body(), true, false, reqOpts{cseq: cs.req.cseq, pcsID: cs.req.pcsID})
+}
+
+// handshake establishes the tunnel and then fires the DMSS app-parity
+// local-channel step. The step runs AFTER the primary path is up and on its
+// own goroutine with a bounded read (localChannelAckTimeout): tunnel
+// establishment is never delayed by it (it used to sit mid-handshake with a
+// full RELAY_READ_TIMEOUT read). The step's inputs are snapshotted BEFORE
+// the goroutine launches — the goroutine must not read mutable tunnel state
+// (chanKey is cleared by reset; a reconnect cycle racing the step would
+// otherwise read a nil key or race the field).
+func (t *Tunnel) handshake() error {
+	if err := t.establish(); err != nil {
+		return err
+	}
+	if t.profile.localChannel {
+		go t.sendLocalChannel(t.localChannelStep())
+	}
+	return nil
+}
+
+// waitForPTCPToken reads PTCP frames until one carries a plausible 0x17
+// token body — the sign the caller slices off at [12:]. Frames with
+// shorter bodies are drained and skipped: the relay agent's late 4-byte
+// SYNC ack used to slip past the old "non-empty body" guard and panic
+// the [12:] slice (slice bounds [12:4] crash loop — live gate round 3,
+// 2026-09-06). A sub-13-byte body can never be the token, so draining it
+// is strictly safer; if the token never arrives, the read timeout
+// surfaces as a regular error instead of a process-killing panic.
+func (t *Tunnel) waitForPTCPToken(u *UDP, timeout time.Duration) (*PTCP, error) {
+	for {
+		p, err := u.ReadPTCP(timeout)
+		if err != nil {
+			return nil, err
+		}
+		if len(p.Body) >= 13 {
+			return p, nil
+		}
+		t.logf("ptcp 0x17: discarding short body (%d bytes: %x) — waiting for token", len(p.Body), p.Body)
+	}
+}
+
+// establish runs the full 4-phase connection: cloud discovery, relay agent
 // allocation, Server Nat Info, inverted STUN punch and PTCP negotiation.
 // On STUN success t.primary = deviceRemote (direct), otherwise mainRemote
 // (relay agent).
-func (t *Tunnel) handshake() error {
-	mainRemote := NewUDP(MAIN_SERVER, MAIN_PORT, t.debug)
+func (t *Tunnel) establish() error {
+	mainRemote := NewUDP(t.profile.mainServer, t.profile.mainPort, t.debug, t.profile)
 	mainRemote.debugLog = t.logf
 	t.socksMu.Lock()
 	t.mainRemote = mainRemote
@@ -321,8 +568,8 @@ func (t *Tunnel) handshake() error {
 
 	// Phase 1: cloud discovery.
 	t.statusf(PhaseCloudLookup, "cloud lookup")
-	mainRemote.Request("/probe/p2psrv", "", true, true)
-	res, _ := mainRemote.Request(fmt.Sprintf("/online/p2psrv/%s", t.serial), "", true, true)
+	mainRemote.RequestEx(t.profile.warmupPath, "", t.profile.warmupAuth, true, reqOpts{warmup: true})
+	res, _ := mainRemote.RequestEx(fmt.Sprintf("/online/p2psrv/%s", t.serial), "", true, true, reqOpts{})
 	if res == nil {
 		return fmt.Errorf("p2psrv lookup failed")
 	}
@@ -333,25 +580,57 @@ func (t *Tunnel) handshake() error {
 	p2psrv := strings.SplitN(us, ":", 2)
 	p2psrvPort, _ := strconv.Atoi(p2psrv[1])
 
-	// Warm-up probes to the device's P2P server (US).
+	// Warm-up probes to the device's P2P server (US). The probes are always
+	// sent (wire parity with upstream); the DMSS profile additionally
+	// recovers the Type-1 RandSalt from the encrypted Info blob here, before
+	// the channel request derives its auth key (upstream requires --randsalt
+	// for this).
 	t.statusf(PhaseDeviceProbe, "device probe")
-	p2psrvRemote := NewUDP(p2psrv[0], p2psrvPort, t.debug)
+	p2psrvRemote := NewUDP(p2psrv[0], p2psrvPort, t.debug, t.profile)
 	p2psrvRemote.debugLog = t.logf
-	p2psrvRemote.Request(fmt.Sprintf("/probe/device/%s", t.serial), "", true, true)
-	p2psrvRemote.Request(fmt.Sprintf("/info/device/%s", t.serial), "", true, true)
+	salt, err := resolveAutoSalt(t.profile, t.dtype, t.randsalt,
+		probeDeviceInfo(p2psrvRemote, t.serial), t.logf)
 	p2psrvRemote.Close()
+	if err != nil {
+		// AutoSalt required (dmss, type 1, no --randsalt) and the blob was
+		// unusable — fail the attempt rather than sign with an empty salt.
+		return fmt.Errorf("autosalt: %v", err)
+	}
+	t.randsalt = salt
 
 	// Phase 2: relay dispatcher lookup.
 	t.statusf(PhaseRelayAlloc, "relay lookup")
-	res, err := mainRemote.Request("/online/relay", "", true, true)
-	if err != nil {
-		return fmt.Errorf("relay lookup: %v", err)
+	var relayHost string
+	var relayPort int
+	if t.profile.relayAgentOptional {
+		// App parity (dmss): the app NEVER calls /online/relay nor
+		// /relay/agent (zero such traffic in the session captures) — its
+		// data path is the punched direct channel over the main cloud
+		// (Policy p2p,udprelay). The dispatcher handed out here can also
+		// stall, so the lookup reads with a SHORT bounded timeout and a
+		// failure only skips the relay-agent stage below.
+		mainRemote.RequestEx("/online/relay", "", true, false, reqOpts{})
+		res, err := mainRemote.Read(false, relayLookupTimeout)
+		if err != nil {
+			t.logf("relay dispatcher lookup failed (%v) — proceeding without TCP relay agent (app-parity: DMSS never uses it)", err)
+		} else if parts := strings.SplitN(res.Body["body/Address"], ":", 2); len(parts) == 2 && parts[0] != "" {
+			relayHost = parts[0]
+			relayPort, _ = strconv.Atoi(parts[1])
+		} else {
+			t.logf("relay dispatcher lookup returned no address — proceeding without TCP relay agent (app-parity: DMSS never uses it)")
+		}
+	} else {
+		res, err = mainRemote.Request("/online/relay", "", true, true)
+		if err != nil {
+			return fmt.Errorf("relay lookup: %v", err)
+		}
+		relay := strings.SplitN(res.Body["body/Address"], ":", 2)
+		relayHost = relay[0]
+		relayPort, _ = strconv.Atoi(relay[1])
 	}
-	relay := strings.SplitN(res.Body["body/Address"], ":", 2)
-	relayPort, _ := strconv.Atoi(relay[1])
 
 	// Data socket for the device side, bound through the main cloud host.
-	deviceRemote := NewUDP(MAIN_SERVER, MAIN_PORT, t.debug)
+	deviceRemote := NewUDP(t.profile.mainServer, t.profile.mainPort, t.debug, t.profile)
 	deviceRemote.debugLog = t.logf
 	t.socksMu.Lock()
 	t.deviceRemote = deviceRemote
@@ -368,36 +647,75 @@ func (t *Tunnel) handshake() error {
 	t.statusf(PhaseP2PChannel, "p2p-channel")
 	aid := make([]byte, 8)
 	rand.Read(aid)
-	body, key := p2pChannelBody(deviceRemote.lport, t.dtype, t.username, t.password, t.randsalt, aid)
-
-	deviceRemote.Request(fmt.Sprintf("/device/%s/p2p-channel", t.serial), body, true, false)
-
-	// Relay agent allocation on the main socket.
-	t.statusf(PhaseRelayAlloc, "relay agent alloc")
-	mainRemote.SetRemote(relay[0], relayPort)
-	res, err = mainRemote.Request("/relay/agent", "", true, true)
-	if err != nil {
-		return fmt.Errorf("relay agent: %v", err)
+	fwdPort := 0
+	if len(t.specs) > 0 {
+		fwdPort = t.specs[0].Remote
 	}
-	token := res.Body["body/Token"]
-	agent := res.Body["body/Agent"]
+	xchg := newChannelSender(deviceRemote, t.serial, t.profile, t.dtype, t.username, t.password,
+		t.randsalt, deviceRemote.lport, fwdPort, aid)
+	xchg.send(false)
+	t.chanKey = xchg.req.key // reused by the post-establishment local-channel step
 
-	agentParts := strings.SplitN(agent, ":", 2)
-	agentPort, _ := strconv.Atoi(agentParts[1])
+	// DMSS profile: app-style retransmission while the request is in flight
+	// (same identity, fresh crypto) so a lost first datagram doesn't cost the
+	// full 15 s read timeout. smartpss keeps the single-send flow.
+	var early *DHResponse
+	if t.profile.channelRetransmit {
+		early = waitChannelEarlyAck(deviceRemote, xchg, t.logf, channelAckWindow)
+	}
 
-	mainRemote.SetRemote(agentParts[0], agentPort)
-	mainRemote.Request(fmt.Sprintf("/relay/start/%s", token), "<body><Client>:0</Client></body>", true, true)
+	// Relay agent allocation on the main socket. Mandatory for smartpss
+	// (upstream semantics byte-for-byte); BEST-EFFORT for relayAgentOptional
+	// profiles (see the Phase 2 note): a short bounded read, and a dead or
+	// silent dispatcher logs and continues instead of failing the attempt.
+	t.statusf(PhaseRelayAlloc, "relay agent alloc")
+	var agentHost string
+	var agentPort int
+	var agentToken string
+	if relayHost != "" {
+		mainRemote.SetRemote(relayHost, relayPort)
+		if t.profile.relayAgentOptional {
+			mainRemote.RequestEx("/relay/agent", "", true, false, reqOpts{})
+			res, err = mainRemote.Read(false, relayAgentTimeout)
+			if err != nil {
+				t.logf("relay dispatcher unavailable — proceeding without TCP relay agent (app-parity: DMSS never uses it)")
+			} else {
+				agentToken = res.Body["body/Token"]
+				agent := strings.SplitN(res.Body["body/Agent"], ":", 2)
+				agentHost = agent[0]
+				agentPort, _ = strconv.Atoi(agent[1])
+			}
+		} else {
+			res, err = mainRemote.Request("/relay/agent", "", true, true)
+			if err != nil {
+				return fmt.Errorf("relay agent: %v", err)
+			}
+			agentToken = res.Body["body/Token"]
+			agent := strings.SplitN(res.Body["body/Agent"], ":", 2)
+			agentHost = agent[0]
+			agentPort, _ = strconv.Atoi(agent[1])
+		}
+	}
+	agentOK := agentHost != ""
+	if agentOK {
+		mainRemote.SetRemote(agentHost, agentPort)
+		mainRemote.Request(fmt.Sprintf("/relay/start/%s", agentToken), "<body><Client>:0</Client></body>", true, true)
+	}
 
 	// Phase 4: Server Nat Info from the device (via cloud/US).
 	t.statusf(PhaseP2PChannel, "waiting for device ack")
-	t.logf("waiting for p2p-channel ack (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-	res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
-	if err == nil && res.Code < 200 {
-		t.logf("waiting for p2p-channel ack body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+	if early == nil {
+		t.logf("waiting for p2p-channel ack (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
 		res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
-	}
-	if err != nil {
-		return fmt.Errorf("read device response: %v", err)
+		if err == nil && res.Code < 200 {
+			t.logf("waiting for p2p-channel ack body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+			res, err = deviceRemote.Read(true, RELAY_READ_TIMEOUT)
+		}
+		if err != nil {
+			return fmt.Errorf("read device response: %v", err)
+		}
+	} else {
+		res = early
 	}
 	if res.Code >= 400 {
 		if res.Code == 404 {
@@ -416,44 +734,53 @@ func (t *Tunnel) handshake() error {
 		nonceStr := res.Body["body/Nonce"]
 		if nonceStr != "" {
 			nonceVal, _ := strconv.Atoi(nonceStr)
-			deviceLaddr = getDec(key, nonceVal, deviceLaddr)
+			deviceLaddr = getDec(xchg.req.key, nonceVal, deviceLaddr)
 		}
 	}
+
+	// DMSS app parity: the app also issues GET /device/<SN>/local-channel
+	// (same Type-1 auth block, no LocalAddr — DevAuth covers nonce+created
+	// only) once the channel is up. Fired after full establishment by
+	// handshake — see there for the non-blocking discipline (M4).
 
 	devParts := strings.SplitN(devicePub, ":", 2)
 	devPort, _ := strconv.Atoi(devParts[1])
 	deviceRemote.SetRemote(devParts[0], devPort)
 
-	// Notify the device about the relay agent.
+	// Notify the device about the relay agent. Skipped when no agent was
+	// allocated (dmss best-effort): the app never sends relay-channel
+	// without an agent either (zero such traffic in the captures).
 	// If the relay agent doesn't ack in time we retry once: cloud sometimes
 	// takes a few extra seconds to propagate the relay assignment.
-	t.statusf(PhaseRelayChannel, "relay-channel")
-	mainRemote.SetRemote(MAIN_SERVER, MAIN_PORT)
-	authStr := ""
-	if t.dtype > 0 {
-		nonce2 := getNonce()
-		authStr = getAuth(t.username, key, nonce2, "", t.randsalt)
-	}
-	sendRelayChannel := func() {
-		mainRemote.Request(fmt.Sprintf("/device/%s/relay-channel", t.serial),
-			fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentParts[0], agentPort),
-			true, false)
-	}
-	sendRelayChannel()
-	mainRemote.SetRemote(agentParts[0], agentPort)
-	t.logf("waiting for relay-channel ack from agent %s:%d (timeout %.0fs)", agentParts[0], agentPort, RELAY_READ_TIMEOUT.Seconds())
-	if _, err := mainRemote.Read(true, RELAY_READ_TIMEOUT); err != nil {
-		// Retry: send relay-channel once more and wait again.
-		// The cloud sometimes takes several extra seconds to propagate the
-		// relay assignment to the agent; a single retry covers this case.
-		t.logf("relay-channel ack timed out (%v) — retrying", err)
-		t.statusf(PhaseRelayChannel, "relay-channel retry")
-		mainRemote.SetRemote(MAIN_SERVER, MAIN_PORT)
+	if agentOK {
+		t.statusf(PhaseRelayChannel, "relay-channel")
+		mainRemote.SetRemote(t.profile.mainServer, t.profile.mainPort)
+		authStr := ""
+		if t.dtype > 0 {
+			nonce2 := getNonce()
+			authStr = getAuth(t.username, xchg.req.key, nonce2, "", t.randsalt)
+		}
+		sendRelayChannel := func() {
+			mainRemote.Request(fmt.Sprintf("/device/%s/relay-channel", t.serial),
+				fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentHost, agentPort),
+				true, false)
+		}
 		sendRelayChannel()
-		mainRemote.SetRemote(agentParts[0], agentPort)
-		t.logf("waiting for relay-channel ack (retry, timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-		if _, err2 := mainRemote.Read(true, RELAY_READ_TIMEOUT); err2 != nil {
-			return fmt.Errorf("relay-channel read: %v", err2)
+		mainRemote.SetRemote(agentHost, agentPort)
+		t.logf("waiting for relay-channel ack from agent %s:%d (timeout %.0fs)", agentHost, agentPort, RELAY_READ_TIMEOUT.Seconds())
+		if _, err := mainRemote.Read(true, RELAY_READ_TIMEOUT); err != nil {
+			// Retry: send relay-channel once more and wait again.
+			// The cloud sometimes takes several extra seconds to propagate the
+			// relay assignment to the agent; a single retry covers this case.
+			t.logf("relay-channel ack timed out (%v) — retrying", err)
+			t.statusf(PhaseRelayChannel, "relay-channel retry")
+			mainRemote.SetRemote(t.profile.mainServer, t.profile.mainPort)
+			sendRelayChannel()
+			mainRemote.SetRemote(agentHost, agentPort)
+			t.logf("waiting for relay-channel ack (retry, timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+			if _, err2 := mainRemote.Read(true, RELAY_READ_TIMEOUT); err2 != nil {
+				return fmt.Errorf("relay-channel read: %v", err2)
+			}
 		}
 	}
 
@@ -462,54 +789,56 @@ func (t *Tunnel) handshake() error {
 
 	// Forced TCP-relay mode: the TOU channel replaces PTCP-over-UDP entirely.
 	if t.useTCP {
+		if !agentOK {
+			return fmt.Errorf("TCP relay forced but no relay agent is available")
+		}
 		t.statusf(PhasePTCPHandshake, "TCP relay attach")
-		if err := t.attachTCPRelay(agentParts[0], agentPort, token); err != nil {
+		if err := t.attachTCPRelay(agentHost, agentPort, agentToken); err != nil {
 			return err
 		}
 		t.logf("TCP relay channel attached (forced)")
 		return nil
 	}
 
-	// PTCP over relay: SYNC then token request (0x17 -> 0x18).
-	t.statusf(PhaseNATPunch, "PTCP sync")
-	mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
-	t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-	p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
-	if err != nil {
-		// UDP relay path dead — try the TCP relay channel if the device
-		// advertises tcprelay support in its policy list.
-		if tcpRelayAllowed {
-			t.logf("ptcp sync over UDP failed (%v) — policy allows tcprelay, trying TCP relay", err)
-			t.statusf(PhasePTCPHandshake, "TCP relay fallback")
-			if aerr := t.attachTCPRelay(agentParts[0], agentPort, token); aerr == nil {
-				t.logf("TCP relay channel attached (fallback)")
-				return nil
-			} else {
-				t.logf("TCP relay fallback failed: %v", aerr)
-			}
-		}
-		return fmt.Errorf("ptcp sync: %v", err)
-	}
-
-	t.statusf(PhaseNATPunch, "PTCP token")
-	mainRemote.RequestPTCP([]byte{
-		0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00,
-	})
-	t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-	p, err = mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
-	if err != nil {
-		return fmt.Errorf("ptcp 0x17: %v", err)
-	}
-	for len(p.Body) == 0 {
-		t.logf("waiting for ptcp 0x17 body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-		p, err = mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
+	// PTCP over relay: SYNC then token request (0x17 -> 0x18). Only with an
+	// allocated agent — without one (dmss best-effort) the punched direct
+	// channel is the only data path, so establishment falls straight through
+	// to the NAT punch below.
+	var sign []byte
+	if agentOK {
+		t.statusf(PhaseNATPunch, "PTCP sync")
+		mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+		t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
 		if err != nil {
-			return fmt.Errorf("ptcp 0x17 wait: %v", err)
+			// UDP relay path dead — try the TCP relay channel if the device
+			// advertises tcprelay support in its policy list.
+			if tcpRelayAllowed {
+				t.logf("ptcp sync over UDP failed (%v) — policy allows tcprelay, trying TCP relay", err)
+				t.statusf(PhasePTCPHandshake, "TCP relay fallback")
+				if aerr := t.attachTCPRelay(agentHost, agentPort, agentToken); aerr == nil {
+					t.logf("TCP relay channel attached (fallback)")
+					return nil
+				} else {
+					t.logf("TCP relay fallback failed: %v", aerr)
+				}
+			}
+			return fmt.Errorf("ptcp sync: %v", err)
 		}
+
+		t.statusf(PhaseNATPunch, "PTCP token")
+		mainRemote.RequestPTCP([]byte{
+			0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00,
+		})
+		t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
+		if err != nil {
+			return fmt.Errorf("ptcp 0x17: %v", err)
+		}
+		sign = p.Body[12:]
+		mainRemote.RequestPTCP(nil)
 	}
-	sign := p.Body[12:]
-	mainRemote.RequestPTCP(nil)
 
 	// Inverted STUN punch (Level 2): build the Init packet from the AID.
 	t.statusf(PhaseNATPunch, "NAT punch")
@@ -590,6 +919,11 @@ func (t *Tunnel) handshake() error {
 	}
 
 	if stunResponse == nil {
+		if !agentOK {
+			// No relay agent to fall back on (dmss best-effort allocation):
+			// without the punched channel there is no data path at all.
+			return fmt.Errorf("STUN punch failed and no relay agent available — no data path")
+		}
 		t.logf("STUN failed — using relay agent as the data path")
 		t.statusf(PhasePTCPHandshake, "relay path")
 		t.primary = mainRemote
@@ -621,8 +955,34 @@ func (t *Tunnel) handshake() error {
 	deviceRemote.SetTimeout(0)
 
 	// Direct path: full PTCP auth handshake with the sign token.
+	if t.profile.noRelayAuth {
+		// App relay dialect (capture 2026-09-06, spike/capture/dmss-capture2.pcap):
+		// after the STUN exchange the client sends exactly ONE PTCP SYNC and
+		// then BIND/DATA — never the 0x17 token request or 0x19 auth. The
+		// device answers a 0x19 with body 0x00 on this generation, and the
+		// 0x17/0x19 traffic on the data socket appears to invalidate the
+		// channel: BINDs still get relay-fabricated 0x12 CONN acks but DATA
+		// is never routed.
+		t.logf("app-parity data path: SYNC only, no 0x17/0x19 auth (dmss relay dialect)")
+		deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+		if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
+			t.logf("app-parity sync: %v (continuing on the punched channel)", err)
+		}
+		t.statusf(PhasePTCPHandshake, "relay path")
+		t.primary = deviceRemote
+		return nil
+	}
 	if err := ptcpHandshake(deviceRemote, sign); err != nil {
-		return fmt.Errorf("ptcp device handshake: %v", err)
+		// The STUN punch succeeded but the device rejected the direct 0x19
+		// auth (observed live 2026-09-06, Picoo F1 4G: every punch completes
+		// and every auth answers body 0x00 — while the relay path serves
+		// video fine). Degrade to the relay agent instead of failing the
+		// port — the pre-noRelayAuth fallback (dmss sessions take the
+		// app-parity branch above and never reach this).
+		t.logf("ptcp device handshake failed (%v) — using relay agent as the data path", err)
+		t.statusf(PhasePTCPHandshake, "relay path")
+		t.primary = mainRemote
+		return nil
 	}
 	t.logf("PTCP handshake complete (direct)")
 	t.primary = deviceRemote
@@ -632,7 +992,7 @@ func (t *Tunnel) handshake() error {
 // attachTCPRelay dials the relay agent over TCP and installs the TOU
 // channel as the active data path (docs/REVERSE.md §14-16).
 func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) error {
-	ch, err := dialTCPRelay(agentHost, agentPort, token, t.debug, t.logf)
+	ch, err := dialTCPRelay(t.profile, agentHost, agentPort, token, t.debug, t.logf)
 	if err != nil {
 		return err
 	}
@@ -641,6 +1001,200 @@ func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) e
 	t.useTCPPath = true
 	t.socksMu.Unlock()
 	return nil
+}
+
+// waitChannelEarlyAck implements the DMSS app's p2p-channel retransmission:
+// the app re-sends the same logical request (~550 ms and ~1.1 s after the
+// first datagram in the capture), keeping CSeq, x-pcs-request-id, Identify,
+// CreateDate, ClientId and RandSalt while regenerating Nonce, DevAuth,
+// LocalAddr and the WSSE digest. Without it, a lost first datagram costs the
+// full 15 s RELAY_READ_TIMEOUT.
+//
+// The wait runs under ONE absolute deadline (start+ackWindow): the read
+// timeout always covers only the time to the nearer of the next retransmit
+// slot or the window's end, so a provisional 1xx (100 Trying) or a stream of
+// unrelated datagrams can neither stretch the wait nor consume the
+// retransmit budget.
+//
+// Matching semantics (live 2026-09-06):
+//   - Any final error response (status >= 400) is TERMINAL regardless of
+//     identity and returned as the outcome. The cloud's 4xx answers carry a
+//     server-GENERATED x-pcs-request-id (stable per device, never an echo)
+//     and would never correlate — the real error must surface instead of
+//     starving the wait.
+//   - 1xx/2xx answers correlate on the request's pcs-id ALONE when the
+//     request carried one: the server sometimes emits `CSeq: 0` on VALID
+//     responses, so CSeq-strict matching starves them. Requests without a
+//     pcs-id keep CSeq matching.
+//   - Nothing is consumed silently: every dropped datagram is logged with
+//     its status line / first-bytes class. A late/matched ack the caller
+//     misses here is still picked up by the caller's normal read path.
+//
+// Returns the final (>= 200) response if it arrives within the window;
+// nil lets the caller fall back to the plain RELAY_READ_TIMEOUT read.
+const (
+	channelAckWindow  = 1800 * time.Millisecond // capture: 100 Trying ~0.7 s, 200 ~1.1 s
+	channelMaxRetrans = 2
+)
+
+func waitChannelEarlyAck(u *UDP, cs *channelSender, logf func(string, ...any), ackWindow time.Duration) *DHResponse {
+	step := ackWindow / 3 // default 1.8 s → re-sends at ~0.6 s / ~1.2 s (capture: ~0.55 s / ~1.1 s)
+	start := time.Now()
+	deadline := start.Add(ackWindow)
+	nextSend := start.Add(step)
+	retransmits := 0
+	for {
+		wait := time.Until(nextSend)
+		if d := time.Until(deadline); d < wait {
+			wait = d
+		}
+		if wait <= 0 {
+			// A slot (retransmit or window end) is due right now.
+			if !time.Now().Before(deadline) {
+				return nil
+			}
+			if retransmits >= channelMaxRetrans {
+				nextSend = deadline // budget spent — wait out the window
+				continue
+			}
+			retransmits++
+			logf("p2p-channel ack timeout — retransmit %d/%d (same identity, fresh crypto)", retransmits, channelMaxRetrans)
+			cs.send(true)
+			nextSend = nextSend.Add(step)
+			continue
+		}
+		data, err := u.Recv(4096, wait)
+		if err != nil {
+			continue // slot/window handling happens at the loop head
+		}
+		res := ParseDHResponse(string(data))
+
+		// Final error responses are terminal regardless of identity: the
+		// cloud's 403s carry a server-generated x-pcs-request-id (never an
+		// echo), so they can never correlate — surface the real error.
+		if res.Code >= 400 {
+			logf("p2p-channel: terminal %d %s — surfacing as the outcome", res.Code, res.Status)
+			return res
+		}
+
+		// 1xx/2xx identity correlation (see the function doc for the live
+		// evidence behind pcs-id-alone matching).
+		drop := func(reason string) {
+			logf("p2p-channel: dropping datagram (%s): %s", reason, datagramClass(data))
+		}
+		if want := cs.req.pcsID; want != "" {
+			if got := respHeader(res, "x-pcs-request-id"); got != want {
+				drop(fmt.Sprintf("x-pcs-request-id %q != %q", got, want))
+				continue
+			}
+		} else if got := respHeader(res, "CSeq"); got != strconv.FormatUint(uint64(cs.req.cseq), 10) {
+			drop(fmt.Sprintf("CSeq %q != %d", got, cs.req.cseq))
+			continue
+		}
+		if res.Code < 200 {
+			// Provisional (100 Trying): neither deadline nor budget move.
+			logf("p2p-channel provisional %d %s — waiting for the final response", res.Code, res.Status)
+			continue
+		}
+		return res
+	}
+}
+
+// datagramClass renders an unmatched datagram for the drop log: the raw
+// status line when it parses as DH HTTP, else a first-bytes fingerprint
+// (PTCP/STUN magic, or a quoted head). Drop decisions are never silent —
+// every dropped datagram names what was dropped.
+func datagramClass(data []byte) string {
+	if len(data) >= 4 {
+		switch {
+		case string(data[:4]) == "PTCP":
+			return "PTCP frame"
+		case data[0] == 0xfe && data[1] == 0xfe:
+			return "STUN frame"
+		}
+	}
+	head := string(data)
+	if i := strings.Index(head, "\r\n"); i >= 0 {
+		return "status line " + strconv.Quote(head[:i])
+	}
+	if len(head) > 32 {
+		head = head[:32]
+	}
+	return "unparseable " + strconv.Quote(head)
+}
+
+// respHeader looks a response header up case-insensitively — the device's
+// header casing is not guaranteed to match ours.
+func respHeader(res *DHResponse, name string) string {
+	for k, v := range res.Headers {
+		if strings.EqualFold(k, name) {
+			return v
+		}
+	}
+	return ""
+}
+
+// localChannelAckTimeout bounds the best-effort local-channel ack read.
+// A var like RELAY_READ_TIMEOUT so tests can shrink it (M4: the step must
+// never stall establishment or shutdown materially). Captured into the
+// step's snapshot at launch (handshake) — the goroutine never reads the var.
+var localChannelAckTimeout = 2 * time.Second
+
+// localChannelStep is the immutable input set of one local-channel step.
+// It is snapshotted before the step's goroutine launches so the step signs
+// from values captured at launch time and never reads mutable tunnel state
+// (or the shrinkable timeout var) afterwards.
+type localChannelStep struct {
+	serial, username string
+	chanKey          []byte // cloned — the snapshot owns its bytes
+	randsalt         string
+	dtype            int
+	ackTimeout       time.Duration // bounds the ack read (localChannelAckTimeout at snapshot time)
+}
+
+// localChannelStep copies the request inputs the local-channel step signs
+// with. The channel key is cloned, not aliased: the snapshot stays valid
+// even if the tunnel's state is reset (chanKey = nil) while the step is
+// still in flight.
+func (t *Tunnel) localChannelStep() localChannelStep {
+	return localChannelStep{
+		serial:     t.serial,
+		username:   t.username,
+		chanKey:    append([]byte(nil), t.chanKey...),
+		randsalt:   t.randsalt,
+		dtype:      t.dtype,
+		ackTimeout: localChannelAckTimeout,
+	}
+}
+
+// sendLocalChannel issues the DMSS app's local-channel request: same Type-1
+// auth block as the channel request but with NO LocalAddr — DevAuth covers
+// nonce+created only. Best-effort app-parity step: failures are logged and
+// the tunnel proceeds exactly like upstream without it. Runs on a separate
+// short-lived socket so it cannot steal the data path's datagrams, and its
+// ack read is bounded (see handshake for the non-blocking discipline).
+// Reads ONLY its snapshot and immutable tunnel fields (profile, debug) —
+// never mutable state (see handshake).
+func (t *Tunnel) sendLocalChannel(step localChannelStep) {
+	t.logf("%s profile: sending /device/%s/local-channel (app-parity step)", t.profile.name, step.serial)
+	u := NewUDP(t.profile.mainServer, t.profile.mainPort, t.debug, t.profile)
+	defer u.Close()
+	if u.initErr != nil {
+		t.logf("%s profile: local-channel socket: %v — continuing", t.profile.name, u.initErr)
+		return
+	}
+	body := ""
+	if step.dtype > 0 {
+		body = fmt.Sprintf("<body>%s</body>", getAuth(step.username, step.chanKey, getNonce(), "", step.randsalt))
+	}
+	u.RequestEx(fmt.Sprintf("/device/%s/local-channel", step.serial), body, true, false,
+		reqOpts{verb: t.profile.verbGet})
+	res, err := u.Read(false, step.ackTimeout)
+	if err != nil {
+		t.logf("%s profile: local-channel ack: %v — continuing", t.profile.name, err)
+		return
+	}
+	t.logf("%s profile: local-channel: %d %s", t.profile.name, res.Code, res.Status)
 }
 
 // ptcpHandshake runs SYNC -> AUTH_REQ(0x19+sign) -> AUTH_RESP(0x1A) ->
@@ -1079,8 +1633,6 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	wait := make(chan struct{})
 	t.setBindWait(realmID, wait)
 
-	t.addClient(realmID, ac.conn, ac.remotePort)
-
 	bindPkt := make([]byte, 20)
 	bindPkt[0] = 0x11
 	binary.BigEndian.PutUint32(bindPkt[4:8], realmID)
@@ -1096,9 +1648,13 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	select {
 	case <-wait:
 		t.logf("Bind OK realm=%#010x in %v", realmID, time.Since(bindStart))
+		// App parity (capture 2026-09-06): DATA flows only AFTER the realm
+		// is confirmed (0x12 CONN). Wiring the client before the bind
+		// pushed realm DATA ahead of the BIND — the device answers that
+		// with an immediate 0x12 DISC.
+		t.addClient(realmID, ac.conn, ac.remotePort)
 	case <-time.After(BIND_TIMEOUT):
 		t.logf("Bind FAILED realm=%#010x port=%d", realmID, ac.remotePort)
-		t.delClient(realmID)
 		ac.conn.Close()
 		t.takeBindWait(realmID)
 	case <-t.done:
@@ -1342,17 +1898,145 @@ func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error))
 	}
 }
 
+// infoFields flattens a /info/device/<SN> payload into tag→value: the device
+// answers either with plain JSON or with a DH response wrapping an XML body.
+func infoFields(text string) (map[string]string, error) {
+	fields := map[string]string{}
+	if strings.HasPrefix(text, "{") {
+		decoded, err := decodeInfoJSON([]byte(text))
+		if err != nil {
+			return nil, fmt.Errorf("json parse: %v", err)
+		}
+		return decoded, nil
+	}
+	resp := ParseDHResponse(text)
+	for k, val := range resp.Body {
+		fields[strings.TrimPrefix(k, "body/")] = val
+	}
+	return fields, nil
+}
+
+// decodeInfoJSON decodes a device Info JSON payload tolerantly: real blobs
+// mix string and numeric fields ("httpport":80), which a map[string]string
+// decode rejects. Scalar fields are surfaced as strings; nested
+// objects/arrays are not flat Info fields and are skipped.
+func decodeInfoJSON(plain []byte) (map[string]string, error) {
+	dec := json.NewDecoder(strings.NewReader(string(plain)))
+	dec.UseNumber()
+	typed := map[string]any{}
+	if err := dec.Decode(&typed); err != nil {
+		return nil, fmt.Errorf("info json: %v", err)
+	}
+	fields := make(map[string]string, len(typed))
+	for k, v := range typed {
+		switch val := v.(type) {
+		case string:
+			fields[k] = val
+		case json.Number:
+			fields[k] = val.String()
+		case bool:
+			fields[k] = strconv.FormatBool(val)
+		}
+	}
+	return fields, nil
+}
+
+// probeDeviceInfo performs the device-p2psrv warm-up on the socket u
+// (already pointed at the device's US): /probe/device, then /info/device,
+// whose response carries the encrypted Info blob. Returns the raw payload
+// (nil when the device doesn't answer). Shared by the tunnel handshake and
+// the multi-mode preflight, which needs the blob for the Type-1 RandSalt.
+func probeDeviceInfo(u *UDP, serial string) []byte {
+	u.Request(fmt.Sprintf("/probe/device/%s", serial), "", true, true)
+	u.Request(fmt.Sprintf("/info/device/%s", serial), "", true, false)
+	data, err := u.Recv(65536, RELAY_READ_TIMEOUT)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// resolveAutoSalt recovers the Type-1 RandSalt from a raw /info/device
+// payload (profile.autoSalt — DMSS: the salt ships inside the encrypted
+// Info blob). Every non-empty input salt is authoritative and returns
+// BEFORE any decode: an explicit --randsalt, and the preflight-resolved
+// salt verifyDevice hands down to the per-port tunnels via runMulti, must
+// never be overwritten by a (possibly different) Info-blob salt. The blob
+// is consulted only when the profile auto-resolves, the device is Type 1
+// and no salt is known yet.
+//
+// Fail-closed: when the salt is REQUIRED for signing (autoSalt profile +
+// Type 1 + no explicit --randsalt) every probe/parse/decrypt/missing-field
+// failure is returned as an error, so callers never fall through to signing
+// with an empty salt — the request would be silently rejected with 403.
+// Choice: when the salt is NOT required (explicit --randsalt or Type 0 —
+// nothing to sign), the input salt returns before decoding and Info
+// failures cannot occur on this path — the blob is informational and must
+// not block tunnel establishment.
+func resolveAutoSalt(prof *appProfile, dtype int, randsalt string, payload []byte, logf func(string, ...any)) (string, error) {
+	required := prof.autoSalt && dtype > 0 && randsalt == ""
+	if payload == nil {
+		if required {
+			return "", fmt.Errorf("device info probe got no answer — cannot resolve the Type-1 RandSalt")
+		}
+		return randsalt, nil
+	}
+	if !prof.autoSalt || dtype == 0 || randsalt != "" {
+		return randsalt, nil
+	}
+	salt, err := randsaltFromInfo(payload)
+	if err != nil {
+		if required {
+			return "", fmt.Errorf("randsalt: %v", err)
+		}
+		logf("%s profile: randsalt from the Info blob unavailable (%v) — continuing", prof.name, err)
+		return randsalt, nil
+	}
+	logf("%s profile: randsalt acquired from the Info blob (len=%d)", prof.name, len(salt))
+	return salt, nil
+}
+
+// randsaltFromInfo recovers the Type-1 RandSalt from a raw /info/device/<SN>
+// payload (DMSS profile: the salt ships in the encrypted Info blob, so
+// --randsalt is not needed).
+func randsaltFromInfo(payload []byte) (string, error) {
+	fields, err := infoFields(strings.TrimSpace(string(payload)))
+	if err != nil {
+		return "", err
+	}
+	info := fields["Info"]
+	if info == "" {
+		return "", fmt.Errorf("Info field absent")
+	}
+	plain, err := decryptDevInfoInfo(info)
+	if err != nil {
+		return "", fmt.Errorf("decrypt Info: %v", err)
+	}
+	// Typed decode reading ONLY randsalt: real blobs mix string and numeric
+	// fields ("httpport":80), which a map[string]string decode rejects.
+	var inner struct {
+		RandSalt string `json:"randsalt"`
+	}
+	if err := json.Unmarshal(plain, &inner); err != nil {
+		return "", fmt.Errorf("info json: %v", err)
+	}
+	if inner.RandSalt == "" {
+		return "", fmt.Errorf("randsalt absent from the Info blob")
+	}
+	return inner.RandSalt, nil
+}
+
 // queryDeviceInfo fetches /info/device/<SN> from the device's P2P server and
 // decrypts the "Info" blob with the hardcoded SDK keys (docs/REVERSE.md
 // 4.2), recovering randsalt / devP2PVersion for Type 1 auth.
-func queryDeviceInfo(serial string, debug bool) int {
-	u := NewUDP(MAIN_SERVER, MAIN_PORT, debug)
+func queryDeviceInfo(serial string, prof *appProfile, debug bool) int {
+	u := NewUDP(prof.mainServer, prof.mainPort, debug, prof)
 	defer u.Close()
 	if u.initErr != nil {
 		fmt.Fprintf(os.Stderr, "main socket: %v\n", u.initErr)
 		return 1
 	}
-	u.Request("/probe/p2psrv", "", true, true)
+	u.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
 	res, _ := u.Request(fmt.Sprintf("/online/p2psrv/%s", serial), "", true, true)
 	if res == nil || res.Code >= 400 || res.Body["body/US"] == "" {
 		fmt.Printf("%s doesn't exist or turned off.\n", serial)
@@ -1361,7 +2045,7 @@ func queryDeviceInfo(serial string, debug bool) int {
 	us := strings.SplitN(res.Body["body/US"], ":", 2)
 	usPort, _ := strconv.Atoi(us[1])
 
-	v := NewUDP(us[0], usPort, debug)
+	v := NewUDP(us[0], usPort, debug, prof)
 	defer v.Close()
 	if v.initErr != nil {
 		fmt.Fprintf(os.Stderr, "device socket: %v\n", v.initErr)
@@ -1375,22 +2059,14 @@ func queryDeviceInfo(serial string, debug bool) int {
 		fmt.Fprintf(os.Stderr, "info read: %v\n", err)
 		return 1
 	}
-	text := strings.TrimSpace(string(data))
 	if debug {
-		fmt.Println(text)
+		fmt.Println(strings.TrimSpace(string(data)))
 	}
 
-	fields := map[string]string{}
-	if strings.HasPrefix(text, "{") {
-		if err := json.Unmarshal([]byte(text), &fields); err != nil {
-			fmt.Fprintf(os.Stderr, "json parse: %v\n", err)
-			return 1
-		}
-	} else {
-		resp := ParseDHResponse(text)
-		for k, val := range resp.Body {
-			fields[strings.TrimPrefix(k, "body/")] = val
-		}
+	fields, err := infoFields(strings.TrimSpace(string(data)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return 1
 	}
 
 	if v2 := fields["devp2pver"]; v2 != "" {
@@ -1415,8 +2091,8 @@ func queryDeviceInfo(serial string, debug bool) int {
 		return 1
 	}
 	fmt.Println("Info (plain) :")
-	inner := map[string]string{}
-	if json.Unmarshal(plain, &inner) == nil {
+	inner, jerr := decodeInfoJSON(plain)
+	if jerr == nil {
 		keys := make([]string, 0, len(inner))
 		for k := range inner {
 			keys = append(keys, k)

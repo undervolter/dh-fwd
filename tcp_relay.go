@@ -45,8 +45,9 @@ type touChannel struct {
 }
 
 // dialTCPRelay performs the full agent attach:
-// TCP connect → DHPOST /tcprelay/client-bind {"Token":...} → SYN → wait ACK.
-func dialTCPRelay(agentHost string, agentPort int, token string, debug bool, logf func(string, ...any)) (*touChannel, error) {
+// TCP connect → <profile post verb> /tcprelay/client-bind {"Token":...} →
+// SYN → wait ACK.
+func dialTCPRelay(prof *appProfile, agentHost string, agentPort int, token string, debug bool, logf func(string, ...any)) (*touChannel, error) {
 	addr := net.JoinHostPort(agentHost, strconv.Itoa(agentPort))
 	logf("tcp-relay: dialing agent %s", addr)
 	conn, err := net.DialTimeout("tcp", addr, tcpRelayDialTimeout)
@@ -60,12 +61,12 @@ func dialTCPRelay(agentHost string, agentPort int, token string, debug bool, log
 	ch := &touChannel{conn: tc, rd: bufio.NewReaderSize(conn, 4096), debug: debug, logf: logf}
 
 	// (A1) bind request over the same TCP socket as plain DH HTTP with WSSE.
-	cseqLock.Lock()
-	cseq++
-	myCseq := cseq
-	cseqLock.Unlock()
+	// The verb is the profile's post verb — DHPOST for smartpss (legacy
+	// byte-for-byte), NFPOST for dmss — and the CSeq follows the profile's
+	// dialect too (counter vs random signed int32), not a hardcoded string.
+	myCseq := nextCSeqFor(prof)
 	bindBody, _ := json.Marshal(map[string]string{"Token": token})
-	req := buildDHRequest("DHPOST", "/tcprelay/client-bind", string(bindBody), true, myCseq)
+	req := buildDHRequest(prof.verbPost, "/tcprelay/client-bind", string(bindBody), true, myCseq, prof, "", false)
 	logf("tcp-relay: >>> bind\n%s", string(req))
 	_ = conn.SetDeadline(time.Now().Add(tcpRelayBindTimeout))
 	if _, err := conn.Write(req); err != nil {

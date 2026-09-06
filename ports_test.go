@@ -130,7 +130,7 @@ func TestRequestPTCPWindowConstant(t *testing.T) {
 	defer rxConn.Close()
 	port := rxConn.LocalAddr().(*net.UDPAddr).Port
 
-	u := NewUDP("127.0.0.1", port, false)
+	u := NewUDP("127.0.0.1", port, false, smartpssProfile)
 	defer u.Close()
 
 	hb := []byte{0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
