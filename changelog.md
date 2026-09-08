@@ -1,6 +1,9 @@
+[08.09.26] dh-fwd v2.1.0
+ - [+] Добавлен профиль dmss для лучшей совместимости с камерами выпущенными после июля 2024 | Added dmss profile for better compatibility with cameras released after July 2024
+ 
 [04.09.26] dh-fwd v2.0.1
- - [+] Добавлен прогресс бар для интуитивности
- - [~] Изменён механизм реконнекта при зависании на запрашивании relay
+ - [+] Добавлен прогресс бар для интуитивности | Added progress bar for better UX
+ - [~] Изменён механизм реконнекта при зависании на запрашивании relay | Improved reconnect mechanism when hanging on relay allocation requests
 
 [02.09.26] dh-fwd v2.0.0
 
