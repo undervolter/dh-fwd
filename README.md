@@ -55,8 +55,8 @@ Or:
 
 `--help` / `-h` shows command list.
 ### WTF are profiles even for?
-Since Dahua uses different protocol dialects across its software (one for SmartPSS and another for DMSS), profile selection was added to dh-fwd.
-I recommend using the smartpss profile for devices released before July 2024. For newer hardware, use the dmss profile.
+Since Dahua uses different servers depending on the ecosystem (easy4ipcloud for SmartPSS or dolynkcloud for DMSS), profile selection was added to the software.
+Use the smartpss profile if you registered your camera via SmartPSS, and dmss if you registered it via DMSS. Otherwise, you'll get a 404 error from the server.
 ### Port Syntax (--port)
 There are two ports: **local** (the one we listen on) and **remote** (the one the camera exposes).
  * **Left side:** local port
