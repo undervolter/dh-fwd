@@ -8,7 +8,7 @@
 
 </div>
 
-A tool for creating tunnels to Dahua cameras (by serial number) and forwarding any port to localhost via the Dahua DH HTTP P2P cloud protocol. Essentially, an improved version of DH-P2P.
+A tool for creating tunnels to Dahua cameras (by serial number) and forwarding any port to localhost via the Dahua P2P cloud protocol.
 
 ## Improvements 
 
@@ -51,7 +51,12 @@ Or:
 | --threads | -mt | Number of threads (default 3) |
 | --pool | - | Counter of pools |
 | --smart-pss | -2 | Forwards ports 80 and 37777 at the same time |
-| --help | -h | Show command list |
+| `--app dmss/smartpss` | `-` | Profile to choose (smartpss or dmss) |
+
+`--help` / `-h` shows command list.
+### Что за профили?
+Since Dahua uses different protocol dialects across its software (one for SmartPSS and another for DMSS), profile selection was added to dh-fwd.
+I recommend using the smartpss profile for devices released before July 2024. For newer hardware, use the dmss profile.
 ### Port Syntax (--port)
 There are two ports: **local** (the one we listen on) and **remote** (the one the camera exposes).
  * **Left side:** local port
