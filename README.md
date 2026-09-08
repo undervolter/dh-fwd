@@ -54,7 +54,7 @@ Or:
 | `--app dmss/smartpss` | `-` | Profile to choose (smartpss or dmss) |
 
 `--help` / `-h` shows command list.
-### Что за профили?
+### WTF are profiles even for?
 Since Dahua uses different protocol dialects across its software (one for SmartPSS and another for DMSS), profile selection was added to dh-fwd.
 I recommend using the smartpss profile for devices released before July 2024. For newer hardware, use the dmss profile.
 ### Port Syntax (--port)
