@@ -58,10 +58,12 @@ func getDeriveKey(username, password, randsalt string) []byte {
 	return []byte(fmt.Sprintf("%X", sum))
 }
 
-// getNonce returns a random int32 for the PBKDF2 salt.
+// getNonce returns a random int32-range value for the PBKDF2 salt. The DMSS
+// app draws negative nonces (signed int32), so the full −2^31..2^31−1 range
+// is used — not the positive-only half.
 func getNonce() int {
-	n, _ := rand.Int(rand.Reader, big.NewInt(1<<31))
-	return int(n.Int64())
+	n, _ := rand.Int(rand.Reader, big.NewInt(1<<32))
+	return int(n.Int64() - 1<<31)
 }
 
 // deriveDK expands the master key: PBKDF2-HMAC-SHA256(key, decimal(nonce), 20000, 32).
@@ -70,7 +72,7 @@ func deriveDK(key []byte, nonce int) []byte {
 	return pbkdf2.Key(key, salt, 20000, 32, sha256.New)
 }
 
-// getEnc encrypts LocalAddr with AES-128-OFB over the derived key and the
+// getEnc encrypts LocalAddr with AES-256-OFB over the derived key and the
 // fixed IV, returning Base64. Section 4.3 step 3 of the spec.
 func getEnc(key []byte, nonce int, data string) string {
 	dk := deriveDK(key, nonce)
@@ -98,18 +100,23 @@ func getDec(key []byte, nonce int, data string) string {
 // getAuth builds the DevAuth XML block: Base64(HMAC-SHA256(masterKey,
 // string(nonce) + string(unixNow) + payload)). Section 4.3 step 4.
 func getAuth(username string, key []byte, nonce int, payload, randsalt string) string {
+	return getAuthAt(username, key, nonce, payload, randsalt, time.Now().Unix())
+}
+
+// getAuthAt is getAuth with a fixed CreateDate — retransmissions keep the
+// original timestamp and refresh only the nonce/payload crypto.
+func getAuthAt(username string, key []byte, nonce int, payload, randsalt string, created int64) string {
 	salt := randsalt
 	if salt == "" {
 		salt = DEFAULT_SALT
 	}
-	curdate := time.Now().Unix()
-	msg := []byte(fmt.Sprintf("%d%d%s", nonce, curdate, payload))
+	msg := []byte(fmt.Sprintf("%d%d%s", nonce, created, payload))
 	mac := hmac.New(sha256.New, key)
 	mac.Write(msg)
 	auth := base64.StdEncoding.EncodeToString(mac.Sum(nil))
 	return fmt.Sprintf(
 		"<CreateDate>%d</CreateDate><DevAuth>%s</DevAuth><Nonce>%d</Nonce><RandSalt>%s</RandSalt><UserName>%s</UserName>",
-		curdate, auth, nonce, salt, username,
+		created, auth, nonce, salt, username,
 	)
 }
 
@@ -237,7 +244,13 @@ func ParseDHResponse(data string) *DHResponse {
 
 	lines := strings.Split(headPart, "\r\n")
 	statusParts := strings.SplitN(lines[0], " ", 3)
-	code, _ := strconv.Atoi(statusParts[1])
+	// Not every payload fed through here carries a DH status line (e.g.
+	// infoFields passes raw /info/device answers); parse leniently instead
+	// of panicking on the missing code.
+	code := 0
+	if len(statusParts) > 1 {
+		code, _ = strconv.Atoi(statusParts[1])
+	}
 
 	headers := make(map[string]string)
 	for _, line := range lines[1:] {
@@ -246,10 +259,14 @@ func ParseDHResponse(data string) *DHResponse {
 		}
 	}
 
+	status := ""
+	if len(statusParts) > 2 {
+		status = strings.Join(statusParts[2:], " ")
+	}
 	resp := &DHResponse{
 		Version: statusParts[0],
 		Code:    code,
-		Status:  strings.Join(statusParts[2:], " "),
+		Status:  status,
 		Headers: headers,
 	}
 	if bodyPart != "" {
@@ -300,11 +317,20 @@ type UDP struct {
 
 	initErr error
 
+	profile *appProfile // request dialect (never nil — nil means smartpss)
+
 	lhost string
 	lport int
 
 	rhost string
 	rport int
+
+	// bindIP is the local IPv4 the OS routes toward rhost (net.Dial on a
+	// UDP socket selects the egress interface without sending traffic). It
+	// is the final LocalAddr entry of the channel request; when the lookup
+	// is impossible (empty host, routing failure) it degrades to loopback —
+	// the legacy dh-fwd form.
+	bindIP string
 
 	raddr *net.UDPAddr
 	debug bool
@@ -331,8 +357,11 @@ const udpRxMax = 65535
 
 var udpListenCfg = net.ListenConfig{Control: udpControl}
 
-func NewUDP(host string, port int, debug bool) *UDP {
-	u := &UDP{rhost: host, rport: port, debug: debug, rxBuf: make([]byte, udpRxMax)}
+func NewUDP(host string, port int, debug bool, prof *appProfile) *UDP {
+	if prof == nil {
+		prof = smartpssProfile
+	}
+	u := &UDP{rhost: host, rport: port, debug: debug, profile: prof, rxBuf: make([]byte, udpRxMax)}
 	pc, err := udpListenCfg.ListenPacket(context.Background(), "udp4", "0.0.0.0:0")
 	if err != nil {
 		u.initErr = err
@@ -350,6 +379,17 @@ func NewUDP(host string, port int, debug bool) *UDP {
 	u.conn = conn
 	u.lhost = local.IP.String()
 	u.lport = local.Port
+
+	// Egress IP toward this peer, resolved once at socket creation. The
+	// "dial" only makes the OS pick a route — no datagram is sent. The
+	// DMSS app advertises this address as the final LocalAddr entry.
+	u.bindIP = "127.0.0.1"
+	if host != "" {
+		if c, err := net.Dial("udp4", net.JoinHostPort(host, strconv.Itoa(port))); err == nil {
+			u.bindIP = c.LocalAddr().(*net.UDPAddr).IP.String()
+			c.Close()
+		}
+	}
 
 	if host != "" {
 		u.raddr, err = net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", host, port))
@@ -493,24 +533,109 @@ func (u *UDP) Read(returnError bool, timeout time.Duration) (*DHResponse, error)
 	return res, nil
 }
 
-// buildDHRequest serializes one DHGET/DHPOST transaction with WSSE cloud
-// auth headers (shared by the UDP transport and the TCP-relay bind).
-func buildDHRequest(method, path, body string, auth bool, myCseq uint32) []byte {
-	nonce, _ := rand.Int(rand.Reader, big.NewInt(1<<31))
-	curdate := time.Now().UTC().Format("2006-01-02T15:04:05Z")
-	pwd := fmt.Sprintf("%d%sDHP2P:%s:%s", nonce, curdate, WSSE_USERNAME, WSSE_USERKEY)
+// nextCSeq allocates the next global CSeq. Request does this implicitly;
+// retransmittable requests pre-allocate so every (re)send reuses one value.
+func nextCSeq() uint32 {
+	cseqLock.Lock()
+	defer cseqLock.Unlock()
+	cseq++
+	return cseq
+}
 
-	h := sha1.New()
-	h.Write([]byte(pwd))
-	digest := base64.StdEncoding.EncodeToString(h.Sum(nil))
+// nextCSeqFor allocates the CSeq for one logical request in the profile's
+// dialect. smartpss keeps the legacy global counter (upstream byte parity);
+// dmss draws a random SIGNED-int32 value like the app does — the small
+// monotonic counter is part of the dh-fwd fingerprint the dmss-bound cloud
+// rejected with 403 DevPwd_InvalidDigest (live 2026-09-06). Allocated ONCE
+// per logical request: retransmissions replay it via reqOpts.cseq /
+// channelRequest.cseq, so the identity stays stable across (re)sends.
+func nextCSeqFor(prof *appProfile) uint32 {
+	if prof.randomCSeq {
+		return uint32(getNonce())
+	}
+	return nextCSeq()
+}
+
+// wsseDigest is the cloud WSSE PasswordDigest:
+// base64(SHA1(nonce + Created + "DHP2P:" + username + ":" + userkey)).
+// The formula is shared by every stock client; only the (username, userkey)
+// pair differs per app (helpers.go header constants / profile.go).
+func wsseDigest(nonce, created, user, userkey string) string {
+	h := sha1.Sum([]byte(nonce + created + "DHP2P:" + user + ":" + userkey))
+	return base64.StdEncoding.EncodeToString(h[:])
+}
+
+// buildDHRequest serializes one DH/NF HTTP-over-UDP transaction with WSSE
+// cloud auth headers (shared by the UDP transport and the TCP-relay bind).
+// The profile carries the stock-client dialect: WSSE pair, verb set, Created
+// timestamp layout and the version headers (smartpss sends none — the
+// pre-profile wire format, byte for byte). pcsID non-empty adds the
+// x-pcs-request-id header (DMSS p2p-channel). warmup marks the stun-style
+// first probe, which carries only X-ToUType — no auth, no version headers
+// (DMSS /online/stun; the smartpss profile has no extra headers, so its
+// warm-up bytes are unaffected).
+//
+// Serialization is profile-gated (live 2026-09-06): the dmss profile emits
+// the APP's header order — request line, X-Version, X-Sversion,
+// x-pcs-request-id, X-ToUType, CSeq, Authorization, X-WSSE, Content-Type,
+// Content-Length — rendering CSeq as a signed decimal (the app's random
+// int32 values go negative). smartpss keeps the legacy CSeq-first layout
+// byte for byte; its counter CSeq never goes negative.
+func buildDHRequest(method, path, body string, auth bool, myCseq uint32, prof *appProfile, pcsID string, warmup bool) []byte {
+	// WSSE nonce: signed int32 range — the app draws negatives too.
+	nonce, _ := rand.Int(rand.Reader, big.NewInt(1<<32))
+	nonceStr := strconv.FormatInt(nonce.Int64()-(1<<31), 10)
+	curdate := prof.createdNow()
+	digest := wsseDigest(nonceStr, curdate, prof.wsseUser, prof.wsseUserKey)
+
+	authBlock := ""
+	if auth {
+		authBlock = fmt.Sprintf(
+			"Authorization: WSSE profile=\"UsernameToken\"\r\nX-WSSE: UsernameToken Username=\"%s\", PasswordDigest=\"%s\", Nonce=\"%s\", Created=\"%s\"\r\n",
+			prof.wsseUser, digest, nonceStr, curdate,
+		)
+	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\nCSeq: %d\r\n", method, path, myCseq))
-	if auth {
-		sb.WriteString(fmt.Sprintf(
-			"Authorization: WSSE profile=\"UsernameToken\"\r\nX-WSSE: UsernameToken Username=\"%s\", PasswordDigest=\"%s\", Nonce=\"%d\", Created=\"%s\"\r\n",
-			WSSE_USERNAME, digest, nonce, curdate,
-		))
+	if prof.appHeaderOrder {
+		sb.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\n", method, path))
+		if !warmup {
+			if prof.version != "" {
+				sb.WriteString(fmt.Sprintf("X-Version: %s\r\n", prof.version))
+			}
+			if prof.sversion != "" {
+				sb.WriteString(fmt.Sprintf("X-Sversion: %s\r\n", prof.sversion))
+			}
+		}
+		if pcsID != "" {
+			sb.WriteString(fmt.Sprintf("x-pcs-request-id: %s\r\n", pcsID))
+		}
+		if prof.toUType != "" {
+			sb.WriteString(fmt.Sprintf("X-ToUType: %s\r\n", prof.toUType))
+		}
+		sb.WriteString(fmt.Sprintf("CSeq: %d\r\n", int32(myCseq)))
+		sb.WriteString(authBlock)
+	} else {
+		sb.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\nCSeq: %d\r\n", method, path, myCseq))
+		sb.WriteString(authBlock)
+		if pcsID != "" {
+			sb.WriteString(fmt.Sprintf("x-pcs-request-id: %s\r\n", pcsID))
+		}
+		if warmup {
+			if prof.toUType != "" {
+				sb.WriteString(fmt.Sprintf("X-ToUType: %s\r\n", prof.toUType))
+			}
+		} else {
+			if prof.version != "" {
+				sb.WriteString(fmt.Sprintf("X-Version: %s\r\n", prof.version))
+			}
+			if prof.sversion != "" {
+				sb.WriteString(fmt.Sprintf("X-Sversion: %s\r\n", prof.sversion))
+			}
+			if prof.toUType != "" {
+				sb.WriteString(fmt.Sprintf("X-ToUType: %s\r\n", prof.toUType))
+			}
+		}
 	}
 	if body != "" {
 		sb.WriteString(fmt.Sprintf("Content-Type: \r\nContent-Length: %d\r\n", len(body)))
@@ -519,19 +644,38 @@ func buildDHRequest(method, path, body string, auth bool, myCseq uint32) []byte 
 	return []byte(sb.String())
 }
 
+// reqOpts carries the per-request extensions used by the profile dialects:
+// an explicit verb ("" = derive from the body), an explicit CSeq
+// (retransmissions reuse the original), the x-pcs-request-id header value,
+// and the warmup (stun-probe) header set.
+type reqOpts struct {
+	verb   string
+	cseq   uint32 // 0 = allocate per the profile dialect (see nextCSeqFor)
+	pcsID  string // non-empty → x-pcs-request-id header
+	warmup bool   // stun-style probe: ToUType only, no version headers
+}
+
 // Request sends one DHGET/DHPOST transaction with WSSE cloud auth.
 func (u *UDP) Request(path, body string, auth, shouldRead bool) (*DHResponse, error) {
-	cseqLock.Lock()
-	cseq++
-	myCseq := cseq
-	cseqLock.Unlock()
+	return u.RequestEx(path, body, auth, shouldRead, reqOpts{})
+}
 
-	method := "DHGET"
-	if body != "" {
-		method = "DHPOST"
+// RequestEx is Request with the profile-dialect extensions (reqOpts).
+func (u *UDP) RequestEx(path, body string, auth, shouldRead bool, ex reqOpts) (*DHResponse, error) {
+	myCseq := ex.cseq
+	if myCseq == 0 {
+		myCseq = nextCSeqFor(u.profile)
 	}
 
-	req := buildDHRequest(method, path, body, auth, myCseq)
+	method := ex.verb
+	if method == "" {
+		method = u.profile.verbGet
+		if body != "" {
+			method = u.profile.verbPost
+		}
+	}
+
+	req := buildDHRequest(method, path, body, auth, myCseq, u.profile, ex.pcsID, ex.warmup)
 
 	if u.debug {
 		u.logf(":%d >>> %s:%d\n%s", u.lport, u.rhost, u.rport, string(req))
