@@ -18,6 +18,8 @@ A tool for creating tunnels to Dahua cameras (by serial number) and forwarding a
 
 ### Not tested
  - Type 1 Auth support
+### Known issues
+ - Not working relay forwarding
 
 > [!NOTE]
 > Dahua may reject requests due to time mismatch.
