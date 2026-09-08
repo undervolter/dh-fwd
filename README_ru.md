@@ -132,6 +132,8 @@ Obtained 2 ports on SN:80,81 | localhost:5080,5081
 * [khoanguyen-3fc/dh-p2p](https://github.com/khoanguyen-3fc/dh-p2p) — базовая реализация протокола Dahua P2P
 * [thebadinteger/p2pwn](https://github.com/thebadinteger/p2pwn/tree/main/core/p2p) — наработки по сетевой части
 
+**Огромнейшее спасибо** **[VGoshev](https://github.com/VGoshev)** **за его титаническую работу!** *(добавил профиль dmss, фиксанул критические баги с аутентификацией, ревёрснул DMSS, и сделал кучу тестов)*
+
 Большое спасибо авторам: **thebadinteger** и **khoanguyen-3fc**.
 
 ### ⚠️ Дисклеймер
