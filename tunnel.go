@@ -38,6 +38,9 @@ var (
 var (
 	relayLookupTimeout = 3 * time.Second
 	relayAgentTimeout  = 3 * time.Second
+
+	relayChannelRetransInterval = 1200 * time.Millisecond
+	relayChannelMaxRetransmits  = 3
 )
 
 var errDeviceNotFound = errors.New("device response: code=404 Not Found")
@@ -661,7 +664,11 @@ func (t *Tunnel) establish() error {
 	// full 15 s read timeout. smartpss keeps the single-send flow.
 	var early *DHResponse
 	if t.profile.channelRetransmit {
-		early = waitChannelEarlyAck(deviceRemote, xchg, t.logf, channelAckWindow)
+		window := channelAckWindow
+		if RELAY_READ_TIMEOUT < window {
+			window = RELAY_READ_TIMEOUT
+		}
+		early = waitChannelEarlyAck(deviceRemote, xchg, t.logf, window)
 	}
 
 	// Relay agent allocation on the main socket. Mandatory for smartpss
@@ -754,33 +761,17 @@ func (t *Tunnel) establish() error {
 	// takes a few extra seconds to propagate the relay assignment.
 	if agentOK {
 		t.statusf(PhaseRelayChannel, "relay-channel")
-		mainRemote.SetRemote(t.profile.mainServer, t.profile.mainPort)
 		authStr := ""
 		if t.dtype > 0 {
 			nonce2 := getNonce()
 			authStr = getAuth(t.username, xchg.req.key, nonce2, "", t.randsalt)
 		}
-		sendRelayChannel := func() {
-			mainRemote.Request(fmt.Sprintf("/device/%s/relay-channel", t.serial),
-				fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentHost, agentPort),
-				true, false)
-		}
-		sendRelayChannel()
-		mainRemote.SetRemote(agentHost, agentPort)
-		t.logf("waiting for relay-channel ack from agent %s:%d (timeout %.0fs)", agentHost, agentPort, RELAY_READ_TIMEOUT.Seconds())
-		if _, err := mainRemote.Read(true, RELAY_READ_TIMEOUT); err != nil {
-			// Retry: send relay-channel once more and wait again.
-			// The cloud sometimes takes several extra seconds to propagate the
-			// relay assignment to the agent; a single retry covers this case.
-			t.logf("relay-channel ack timed out (%v) — retrying", err)
-			t.statusf(PhaseRelayChannel, "relay-channel retry")
-			mainRemote.SetRemote(t.profile.mainServer, t.profile.mainPort)
-			sendRelayChannel()
-			mainRemote.SetRemote(agentHost, agentPort)
-			t.logf("waiting for relay-channel ack (retry, timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-			if _, err2 := mainRemote.Read(true, RELAY_READ_TIMEOUT); err2 != nil {
-				return fmt.Errorf("relay-channel read: %v", err2)
+		if err := t.waitRelayChannelAck(mainRemote, agentHost, agentPort, authStr); err != nil {
+			if t.useTCP {
+				return err
 			}
+			t.logf("relay-channel ack timed out (%v) — continuing to STUN punch without relay agent", err)
+			agentOK = false
 		}
 	}
 
@@ -1032,10 +1023,53 @@ func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) e
 //
 // Returns the final (>= 200) response if it arrives within the window;
 // nil lets the caller fall back to the plain RELAY_READ_TIMEOUT read.
-const (
+var (
 	channelAckWindow  = 1800 * time.Millisecond // capture: 100 Trying ~0.7 s, 200 ~1.1 s
 	channelMaxRetrans = 2
 )
+
+// waitRelayChannelAck notifies the device via the main server about the allocated
+// relay agent, and waits for the agent to acknowledge. Because UDP datagrams may be
+// dropped and the cloud/agent can take a moment to propagate, it retransmits
+// /relay-channel at short intervals rather than blocking for a full 15s timeout.
+func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPort int, authStr string) error {
+	reqPath := fmt.Sprintf("/device/%s/relay-channel", t.serial)
+	reqBody := fmt.Sprintf("<body>%s<agentAddr>%s:%d</agentAddr></body>", authStr, agentHost, agentPort)
+	cseq := nextCSeqFor(t.profile)
+
+	sendRelayChannel := func() {
+		mainRemote.SetRemote(t.profile.mainServer, t.profile.mainPort)
+		mainRemote.RequestEx(reqPath, reqBody, true, false, reqOpts{cseq: cseq})
+		mainRemote.SetRemote(agentHost, agentPort)
+	}
+
+	interval := relayChannelRetransInterval
+	if RELAY_READ_TIMEOUT < interval {
+		interval = RELAY_READ_TIMEOUT
+	}
+
+	sendRelayChannel()
+	t.logf("waiting for relay-channel ack from agent %s:%d (interval %v, max %d retries)",
+		agentHost, agentPort, interval, relayChannelMaxRetransmits)
+
+	var lastErr error
+	for attempt := 0; attempt <= relayChannelMaxRetransmits; attempt++ {
+		res, err := mainRemote.Read(true, interval)
+		if err == nil {
+			if t.debug {
+				t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
+			}
+			return nil
+		}
+		lastErr = err
+		if attempt < relayChannelMaxRetransmits {
+			t.logf("relay-channel ack timed out (%v) — retransmitting %d/%d", err, attempt+1, relayChannelMaxRetransmits)
+			t.statusf(PhaseRelayChannel, fmt.Sprintf("relay-channel retry %d/%d", attempt+1, relayChannelMaxRetransmits))
+			sendRelayChannel()
+		}
+	}
+	return fmt.Errorf("relay-channel read: %w", lastErr)
+}
 
 func waitChannelEarlyAck(u *UDP, cs *channelSender, logf func(string, ...any), ackWindow time.Duration) *DHResponse {
 	step := ackWindow / 3 // default 1.8 s → re-sends at ~0.6 s / ~1.2 s (capture: ~0.55 s / ~1.1 s)

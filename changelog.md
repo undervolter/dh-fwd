@@ -1,3 +1,6 @@
+[11.09.26] dh-fwd v2.1.1
+ - [~] Добавлен механизм повторного соединения в случае если промежуточный сервер не отвечает | Added reconnect mechanism in case the relay server does not respond
+
 [08.09.26] dh-fwd v2.1.0
  - [+] Добавлен профиль dmss для лучшей совместимости с камерами выпущенными после июля 2024 | Added dmss profile for better compatibility with cameras released after July 2024
  

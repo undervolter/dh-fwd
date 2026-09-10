@@ -477,7 +477,11 @@ func verifyDevice(serial string, prof *appProfile, dtype int, username, password
 	ch := newChannelSender(u, serial, prof, dtype, username, password, randsalt, u.lport, fwdPort, aid)
 	ch.send(false)
 	if prof.channelRetransmit {
-		if early := waitChannelEarlyAck(u, ch, logf, channelAckWindow); early != nil {
+		window := channelAckWindow
+		if RELAY_READ_TIMEOUT < window {
+			window = RELAY_READ_TIMEOUT
+		}
+		if early := waitChannelEarlyAck(u, ch, logf, window); early != nil {
 			return early.Code < 400, randsalt
 		}
 	}
