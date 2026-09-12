@@ -33,11 +33,7 @@ go build -o dh-fwd .
 
 ```
 ## Usage
-```sh
-dh-fwd [options] <serial>
 
-```
-Or:
 ```sh
 ./dh-fwd <serial> [options]
 
