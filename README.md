@@ -16,10 +16,8 @@ A tool for creating tunnels to Dahua cameras (by serial number) and forwarding a
 - Supports **multithreading**
 - Can build stable tunnels
 
-### Not tested
- - Type 1 Auth support
 ### Known issues
- - Not working relay forwarding
+ - Sometimes relay forwarding can work badly
 
 > [!NOTE]
 > Dahua may reject requests due to time mismatch.
