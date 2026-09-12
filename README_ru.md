@@ -25,7 +25,7 @@ go build .
 
 ```
 
-**Или:**
+**Как использовать:**
 
 ```sh
 ./dh-fwd <serial> [options]
