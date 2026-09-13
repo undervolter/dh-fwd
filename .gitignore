@@ -4,3 +4,16 @@ dh-fwd.exe
 *.bin
 builds/
 *.exe~
+
+# local research notes (not part of the codebase)
+CVE-*_Analysis.md
+fixmoji.exe
+
+# tests
+*_test.go
+
+# logs
+*.log
+
+# scripts
+*.ps1

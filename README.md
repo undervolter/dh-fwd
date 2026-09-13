@@ -48,6 +48,8 @@ go build -o dh-fwd .
 | --pool | - | Counter of pools |
 | --smart-pss | -2 | Forwards ports 80 and 37777 at the same time |
 | `--app dmss/smartpss` | `-` | Profile to choose (smartpss or dmss) |
+| --pool | - | Counter of pools |
+| --tcp-relay | -R | Force TCP-relay data path |
 
 `--help` / `-h` shows command list.
 ### WTF are profiles even for?
@@ -76,7 +78,10 @@ Local ports are bound to localhost.
 **Single** — forwards only 1 port:
 ```sh
 ./dh-fwd SN -p 5080:80
-
+```
+```text
+[23:54] dh-fwd v2.2.0 (latest)
+Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on :1337 †’ :80
 ```
 **Multi** — forwards multiple ports simultaneously. Activates automatically if multiple ports are specified, or if -mt is explicitly set:
 ```sh
@@ -84,12 +89,8 @@ Local ports are bound to localhost.
 
 ```
 ```text
-Opening 2 ports on SN | Threads: 3
-[..] Opening SN:80 | Connecting...
-[OK] Obtained SN:80 -> 127.0.0.1:5080
-[OK] Obtained SN:81 -> 127.0.0.1:5081
-Obtained 2 ports on SN:80,81 | localhost:5080,5081
-
+[00:10] dh-fwd v2.2.0 (latest)
+Connecting to 4C04441PAG726F6:80,81 [=======================>] 100 % | Listening on :5080, 5081
 ```
 
 ## What is Dahua P2P protocol?

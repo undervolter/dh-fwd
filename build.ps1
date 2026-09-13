@@ -1,15 +1,11 @@
-﻿#!/usr/bin/env pwsh
-# build.ps1 — cross-compile dh-fwd for all target platforms
-# Usage: .\build.ps1 [-Version "2.0.1"] [-OutDir "builds"]
-
 param(
-    [string]$Version  = "dev",
+    [string]$Version  = "v2.2.0",
     [string]$OutDir   = "builds"
 )
 
 $ErrorActionPreference = "Stop"
 
-# ── targets ──────────────────────────────────────────────────────────────────
+# Targets
 $Targets = @(
     @{ GOOS = "windows"; GOARCH = "amd64"; Name = "dh-fwd_win_x64.exe"   }
     @{ GOOS = "windows"; GOARCH = "arm64"; Name = "dh-fwd_win_arm64.exe" }
@@ -17,7 +13,7 @@ $Targets = @(
     @{ GOOS = "linux";   GOARCH = "arm64"; Name = "dh-fwd_linux_arm64"   }
 )
 
-# ── prep ──────────────────────────────────────────────────────────────────────
+# Prep
 $Root = $PSScriptRoot
 if (-not $Root) { $Root = (Get-Location).Path }
 
@@ -30,10 +26,10 @@ $err = 0
 Write-Host ""
 Write-Host "  dh-fwd cross-build  |  version: $Version" -ForegroundColor Cyan
 Write-Host "  output: $OutDir\" -ForegroundColor Cyan
-Write-Host ("  " + ("─" * 52)) -ForegroundColor DarkGray
+Write-Host ("  " + ("-" * 52)) -ForegroundColor DarkGray
 Write-Host ""
 
-# ── build loop ────────────────────────────────────────────────────────────────
+# Build loop
 foreach ($t in $Targets) {
     $out   = "$Root\$OutDir\$($t.Name)"
     $label = "$($t.GOOS)/$($t.GOARCH)".PadRight(18)
@@ -61,14 +57,14 @@ foreach ($t in $Targets) {
     }
 }
 
-# ── cleanup env ───────────────────────────────────────────────────────────────
+# Cleanup env
 Remove-Item Env:\GOOS        -ErrorAction SilentlyContinue
 Remove-Item Env:\GOARCH      -ErrorAction SilentlyContinue
 Remove-Item Env:\CGO_ENABLED -ErrorAction SilentlyContinue
 
-# ── summary ───────────────────────────────────────────────────────────────────
+# Summary
 Write-Host ""
-Write-Host ("  " + ("─" * 52)) -ForegroundColor DarkGray
+Write-Host ("  " + ("-" * 52)) -ForegroundColor DarkGray
 if ($err -eq 0) {
     Write-Host "  All $ok builds succeeded." -ForegroundColor Green
 } else {

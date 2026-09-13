@@ -21,12 +21,17 @@ import (
 )
 
 const (
-	tcpRelayDialTimeout    = 10 * time.Second
+	tcpRelayDialTimeout    = 4 * time.Second
 	tcpRelayBindTimeout    = 15 * time.Second
 	tcpRelayAckTimeout     = 15 * time.Second
 	tcpRelayFrameTimeout   = 10 * time.Second
 	tcpRelayWriteTimeout   = 10 * time.Second
-	tcpRelayKeepaliveEvery = 20 * time.Second
+	// Keepalive must be strictly shorter than HEARTBEAT_TIMEOUT (10 s):
+	// each keepalive round-trips an ACK that refreshes LastRecv, and the
+	// touReadLoop kills the tunnel when LastRecv exceeds the heartbeat
+	// timeout. At 20 s every silent gap longer than the timeout murdered
+	// healthy channels (live 2026-09-13 audit).
+	tcpRelayKeepaliveEvery = 7 * time.Second
 )
 
 // touChannel is a live TOU session channel to the relay agent.

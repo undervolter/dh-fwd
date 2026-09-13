@@ -397,6 +397,9 @@ func NewUDP(host string, port int, debug bool, prof *appProfile) *UDP {
 			u.initErr = err
 		}
 	}
+	// lastRecv starts at socket creation so the first readLoop timeout
+	// measures silence from socket creation, not from epoch.
+	u.lastRecv = time.Now()
 	return u
 }
 
@@ -496,7 +499,7 @@ func (u *UDP) logf(format string, args ...any) {
 		u.debugLog(format, args...)
 		return
 	}
-	fmt.Printf(format+"\n", args...)
+	writeLog(format, args...)
 }
 
 func (u *UDP) SetTimeout(d time.Duration) {

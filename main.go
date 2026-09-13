@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"net"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +20,7 @@ const (
 	PortConnecting PortState = iota
 	PortOK
 	PortFAIL
+	PortDROPPED
 )
 
 type failEntry struct {
@@ -54,7 +54,9 @@ func newPortRegistry(serial string, specs []PortSpec, ui *UI) *PortRegistry {
 	}
 	for i := range specs {
 		r.states[i] = PortConnecting
-		ui.Update(i, r.line(i, PortConnecting, ""))
+		if ui != nil {
+			ui.Update(i, r.line(i, PortConnecting, ""))
+		}
 	}
 	return r
 }
@@ -90,7 +92,9 @@ func (r *PortRegistry) set(idx int, st PortState, reason string) {
 	pending := r.pending
 	r.mu.Unlock()
 
-	r.ui.Update(idx, line)
+	if r.ui != nil {
+		r.ui.Update(idx, line)
+	}
 
 	if st != PortConnecting && pending == 0 {
 		select {
@@ -119,16 +123,35 @@ func (r *PortRegistry) pendingCount() int {
 	return r.pending
 }
 
+func (r *PortRegistry) drop(idx int) {
+	r.mu.Lock()
+	r.states[idx] = PortDROPPED
+	r.mu.Unlock()
+}
+
+func (r *PortRegistry) okCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cnt := 0
+	for _, st := range r.states {
+		if st == PortOK {
+			cnt++
+		}
+	}
+	return cnt
+}
+
 func (r *PortRegistry) summary() (remotes, locals []int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	remotes = make([]int, len(r.specs))
-	locals = make([]int, len(r.specs))
 	for i, s := range r.specs {
-		remotes[i] = s.Remote
-		locals[i] = r.actualPorts[i]
-		if locals[i] == 0 {
-			locals[i] = s.Local
+		if r.states[i] == PortOK {
+			remotes = append(remotes, s.Remote)
+			l := r.actualPorts[i]
+			if l == 0 {
+				l = s.Local
+			}
+			locals = append(locals, l)
 		}
 	}
 	return remotes, locals
@@ -211,6 +234,9 @@ func main() {
 		os.Exit(2)
 	}
 
+	_ = initLogger("")
+	defer closeLogger()
+
 	HEARTBEAT_TIMEOUT = hbTimeout
 
 	prof, err := profileByName(appName)
@@ -252,6 +278,14 @@ func main() {
 			multi = true
 		}
 	})
+
+	if !checkUpdate() {
+		return
+	}
+
+	if tcpRelayMode {
+		fmt.Println("[!] Dahua may not accept TCP connections!")
+	}
 
 	if multi {
 		runMulti(serial, prof, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
@@ -408,7 +442,7 @@ func makePortSpecs(locals, remotes []int) ([]PortSpec, error) {
 func runSingle(serial string, prof *appProfile, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int) {
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{spec}}
 	t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, nil)
-	cp := NewConnectProgress(os.Stdout, serial, spec.Remote)
+	cp := NewConnectProgress(os.Stdout, fmt.Sprintf("%s:%d", serial, spec.Remote))
 	t.progress = cp
 	runWithRetries(t, cp, func(err error) {
 		if errors.Is(err, errDeviceNotFound) {
@@ -429,9 +463,7 @@ func runSingle(serial string, prof *appProfile, spec PortSpec, dtype int, userna
 // it instead of re-deriving it.
 func verifyDevice(serial string, prof *appProfile, dtype int, username, password, randsalt string, specs []PortSpec, debug bool) (bool, string) {
 	logf := func(format string, args ...any) {
-		if debug {
-			fmt.Printf(format+"\n", args...)
-		}
+		writeLog(format, args...)
 	}
 	u := NewUDP(prof.mainServer, prof.mainPort, debug, prof)
 	defer u.Close()
@@ -515,9 +547,17 @@ func runMulti(serial string, prof *appProfile, specs []PortSpec, threads int, dt
 	// (DMSS profile) — all tunnels below reuse it, no per-port re-derivation.
 	randsalt = salt
 
-	ui := NewUI(os.Stdout)
-	ui.Start(fmt.Sprintf("Opening %d ports on %s | Threads: %d", len(specs), serial, threads), len(specs))
-	reg := newPortRegistry(serial, specs, ui)
+	var remoteStrs []string
+	seen := make(map[int]bool)
+	for _, s := range specs {
+		if !seen[s.Remote] {
+			seen[s.Remote] = true
+			remoteStrs = append(remoteStrs, strconv.Itoa(s.Remote))
+		}
+	}
+	target := fmt.Sprintf("%s:%s", serial, strings.Join(remoteStrs, ","))
+	cp := NewConnectProgress(os.Stdout, target)
+	reg := newPortRegistry(serial, specs, nil)
 
 	var live sync.Map
 	for _, g := range distribute(specs, threads) {
@@ -525,6 +565,7 @@ func runMulti(serial string, prof *appProfile, specs []PortSpec, threads int, dt
 			continue
 		}
 		t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
+		t.progress = cp
 		for _, idx := range g.idxs {
 			live.Store(idx, t)
 		}
@@ -554,7 +595,19 @@ func runMulti(serial string, prof *appProfile, specs []PortSpec, threads int, dt
 				})
 				os.Exit(1)
 			}
-			switch showFailPrompt(serial, fails, ui) {
+			// If at least one port connected successfully, auto-drop failed ports
+			if reg.okCount() > 0 {
+				for _, f := range fails {
+					if v, ok := live.Load(f.idx); ok {
+						v.(*Tunnel).close()
+						live.Delete(f.idx)
+					}
+					reg.drop(f.idx)
+					fmt.Printf("\r[-] Dropping %s:%d (%s)                                \n", serial, f.spec.Remote, f.reason)
+				}
+				continue
+			}
+			switch showFailPrompt(serial, fails, nil) {
 			case 'c':
 				live.Range(func(k, v any) bool {
 					v.(*Tunnel).close()
@@ -566,54 +619,45 @@ func runMulti(serial string, prof *appProfile, specs []PortSpec, threads int, dt
 					reg.connecting(f.idx)
 					g := specGroup{idxs: []int{f.idx}, specs: []PortSpec{f.spec}}
 					t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, g, reg)
+					t.progress = cp
 					live.Store(f.idx, t)
 					go runWithRetries(t, nil, nil)
 				}
 				summarized = false
+			case 'd':
+				for _, f := range fails {
+					if v, ok := live.Load(f.idx); ok {
+						v.(*Tunnel).close()
+						live.Delete(f.idx)
+					}
+					reg.drop(f.idx)
+					fmt.Printf("\r[-] Dropping %s:%d (%s)                                \n", serial, f.spec.Remote, f.reason)
+				}
+				if reg.okCount() == 0 {
+					fmt.Println("[-] No active ports remaining.")
+					os.Exit(1)
+				}
 			}
 			continue
 		}
 		if !summarized {
-			printSummary(serial, reg, ui)
+			_, locals := reg.summary()
+			var localStrs []string
+			for i, p := range locals {
+				if i == 0 {
+					localStrs = append(localStrs, fmt.Sprintf(":%d", p))
+				} else {
+					localStrs = append(localStrs, strconv.Itoa(p))
+				}
+			}
+			if len(localStrs) == 0 {
+				fmt.Println("[-] No active ports remaining.")
+				os.Exit(1)
+			}
+			cp.Done(fmt.Sprintf("Listening on %s", strings.Join(localStrs, ", ")))
 			summarized = true
 		}
 	}
-}
-
-func printSummary(serial string, reg *PortRegistry, ui *UI) {
-	remotes, locals := reg.summary()
-	ui.Below(fmt.Sprintf("Obtained %d ports on %s:%s | localhost:%s",
-		len(remotes), serial, formatRange(remotes), formatList(locals)))
-}
-
-func formatRange(ports []int) string {
-	p := append([]int{}, ports...)
-	sort.Ints(p)
-	var b strings.Builder
-	for i := 0; i < len(p); {
-		j := i
-		for j+1 < len(p) && p[j+1] == p[j]+1 {
-			j++
-		}
-		if j == i {
-			fmt.Fprintf(&b, "%d", p[i])
-		} else {
-			fmt.Fprintf(&b, "%d-%d", p[i], p[j])
-		}
-		if j+1 < len(p) {
-			b.WriteString(",")
-		}
-		i = j + 1
-	}
-	return b.String()
-}
-
-func formatList(ports []int) string {
-	s := make([]string, len(ports))
-	for i, p := range ports {
-		s[i] = strconv.Itoa(p)
-	}
-	return strings.Join(s, ",")
 }
 
 func showFailPrompt(serial string, fails []failEntry, ui *UI) byte {
@@ -622,21 +666,31 @@ func showFailPrompt(serial string, fails []failEntry, ui *UI) byte {
 	for i, f := range fails {
 		reasons[i] = fmt.Sprintf("%d: %s", f.spec.Remote, f.reason)
 	}
-	ui.Below(sep)
-	ui.Below(fmt.Sprintf("Failed to obtain port(s) on %s. Reasons: %s", serial, strings.Join(reasons, "; ")))
-	ui.Below(sep)
+	println := func(s string) {
+		if ui != nil {
+			ui.Below(s)
+		} else {
+			fmt.Println(s)
+		}
+	}
+	println(sep)
+	println(fmt.Sprintf("Failed to obtain port(s) on %s. Reasons: %s", serial, strings.Join(reasons, "; ")))
+	println(sep)
 
 	reader := bufio.NewReader(os.Stdin)
 	for {
-		ui.Below(fmt.Sprintf("Retry failed ports or close ALL connections to %s? (r/c)", serial))
+		println(fmt.Sprintf("Retry failed ports, (d)rop failed, or (c)lose ALL connections to %s? (r/d/c)", serial))
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			return 'c'
 		}
-		switch strings.ToLower(strings.TrimSpace(line)) {
-		case "r":
+		trimmed := strings.ToLower(strings.TrimSpace(line))
+		switch trimmed {
+		case "r", "к", "р":
 			return 'r'
-		case "c":
+		case "d", "д", "в", "drop", "i", "ш", "ignore":
+			return 'd'
+		case "c", "с", "close":
 			return 'c'
 		}
 	}

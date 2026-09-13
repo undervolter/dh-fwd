@@ -49,6 +49,7 @@ go build .
 | `--pool` | `-` | Количество реалмов в пуле (по умолчанию 50) |
 | `--smart-pss` | `-2` | Форвардит порты 80 и 37777 одновременно |
 | `--app dmss/smartpss` | `-` | Выбор профиля (smartpss или dmss) |
+| `--tcp-relay` | `-R` | Принудительный перевод в TCP |
 
 `--help` / `-h` выводит список всех доступных команд.
 
@@ -89,7 +90,10 @@ go build .
 
 ```sh
 ./dh-fwd SN -p 5080:80
-
+```
+```sh
+[23:54] dh-fwd v2.2.0 (latest)
+Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on :1337
 ```
 
 **Multi** — форвардит несколько портов одновременно. Срабатывает автоматически, если передано несколько портов или включен многопоточный режим:
@@ -100,12 +104,8 @@ go build .
 ```
 
 ```text
-Opening 2 ports on SN | Threads: 4
-[..] Opening SN:80 | Connecting...
-[OK] Obtained SN:80 -> 127.0.0.1:5080
-[OK] Obtained SN:81 -> 127.0.0.1:5081
-Obtained 2 ports on SN:80,81 | localhost:5080,5081
-
+[23:59] dh-fwd v2.2.0 (latest)
+Connecting to 4C04441PAG726F6:80,81 [=======================>] 100 % | Listening on :5080, 5081
 ```
 
 ## Что такое Dahua P2P?
@@ -139,4 +139,4 @@ Obtained 2 ports on SN:80,81 | localhost:5080,5081
 
 ## Лицензия
 
-Распространяется под лицензией GNU General Public License v3.0 (GPLv3). Подробности — в файле `LICENSE`.
+Распространяется под лицензией MIT, подробности — в файле `LICENSE`

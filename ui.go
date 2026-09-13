@@ -95,19 +95,17 @@ const (
 type ConnectProgress struct {
 	mu      sync.Mutex
 	w       io.Writer
-	serial  string
-	port    int
+	target  string
 	phase   int
 	status  string
 	filled  int
 	attempt int
 }
 
-func NewConnectProgress(w io.Writer, serial string, port int) *ConnectProgress {
+func NewConnectProgress(w io.Writer, target string) *ConnectProgress {
 	cp := &ConnectProgress{
 		w:      w,
-		serial: serial,
-		port:   port,
+		target: target,
 	}
 	cp.render()
 	return cp
@@ -182,17 +180,20 @@ func (cp *ConnectProgress) render() {
 	filled := cp.filled
 	status := cp.status
 	attempt := cp.attempt
-	serial := cp.serial
-	port := cp.port
+	target := cp.target
 	cp.mu.Unlock()
 
 	pct := 0
 	var bar string
 	if filled >= cpBarWidth {
-		bar = strings.Repeat("=", cpBarWidth)
+		bar = strings.Repeat("=", cpBarWidth-1) + ">"
 		pct = 100
 	} else {
-		bar = strings.Repeat("=", filled) + ">" + strings.Repeat(" ", cpBarWidth-filled)
+		spaces := cpBarWidth - 1 - filled
+		if spaces < 0 {
+			spaces = 0
+		}
+		bar = strings.Repeat("=", filled) + ">" + strings.Repeat(" ", spaces)
 		pct = filled * 100 / cpBarWidth
 	}
 
@@ -201,6 +202,10 @@ func (cp *ConnectProgress) render() {
 		attemptStr = fmt.Sprintf(" [retry %d/%d]", attempt, RETRY_ATTEMPTS)
 	}
 
-	fmt.Fprintf(cp.w, "\rConnecting to %s:%d%s [%s] %3d%% | %-20s",
-		serial, port, attemptStr, bar, pct, status)
+	line := fmt.Sprintf("Connecting to %s%s [%s] %3d %% | %s",
+		target, attemptStr, bar, pct, status)
+	if len(line) < 110 {
+		line += strings.Repeat(" ", 110-len(line))
+	}
+	fmt.Fprintf(cp.w, "\r%s", line)
 }

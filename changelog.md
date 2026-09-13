@@ -1,3 +1,22 @@
+[14.09.26] dh-fwd v2.2.0
+ - [+] Fallback для TCP Relay (-R) (проверка совместимости)  | TCP relay fallback (-R) (compatibility check)
+ - [+] Авто-дроп неактивных портов камеры | Auto-drop inactive ports
+ - [+] Переработан механизм реконнекта без нового построения туннеля | Recoded reconnect mechanism without building a new tunnel
+ - [+] Глобальный семафор на /relay/agent (защита easy4ip/dolynk от потери пакетов) | Global semaphore on concurrent /relay/agent allocations
+ - [+] Ротация и failover relay-диспетчеров | Relay dispatcher rotation and failover
+ - [+] Ретрансмиты /relay/start с коротким чтением | Bounded /relay/start retransmits
+ - [~] fixed: поддержка русской раскладки клавиатуры (с/к/р/д/в) в диалогах выбора, устранено зацикливание промпта | fixed: Russian keyboard layout support in fail prompts, preventing infinite input loops
+ - [~] fixed: ложные дисконнекты в TCP-relay — интервал keepalive снижен с 20с до 7с (таймаут канала был 10с) | fixed: false TCP-relay disconnects — lowered keepalive interval from 20s to 7s (below 10s heartbeat timeout)
+ - [~] fixed: nil-паника в clientReader при отправке DISC в обнулённый primary после reset | fixed: nil pointer dereference in clientReader sending DISC to a reset primary
+ - [~] fixed: игнорирование мусорных и не-PTCP пакетов в readLoop вместо аварийного закрытия живого туннеля | fixed: ignore non-PTCP frames and late ACK duplicates instead of tearing down healthy tunnels
+ - [~] fixed: мгновенный выход при занятом локальном порту ("no listeners available") без бесполезных 4-х циклов ретрая | fixed: fast abort on terminal listener bind errors instead of burning retry attempts
+ - [~] fixed: инициализация lastRecv текущим временем в NewUDP (предотвращает ложный мгновенный таймаут сокета) | fixed: initialize UDP.lastRecv to time.Now() avoiding false instant timeouts
+ - [~] fixed: утечка сокетов в очереди acceptCh при закрытии туннеля | fixed: socket leak in acceptCh during tunnel teardown
+	misc
+ - [+] Механизм автообновления | Auto upgrade mechanism
+ - [+] Немного изменённый UI | A little bit changed UI
+ - [~] reworked: Механизм логов - теперь они пишутся не в терминал а в .log |  Log mechanism - now they're writing in .log, not in stdout
+
 [11.09.26] dh-fwd v2.1.1
  - [~] Добавлен механизм повторного соединения в случае если промежуточный сервер не отвечает | Added reconnect mechanism in case the relay server does not respond
 
