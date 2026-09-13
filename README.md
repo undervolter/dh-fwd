@@ -109,4 +109,4 @@ Special thanks to: **thebadinteger** and **khoanguyen-3fc**.
 ## ⚠️ Disclaimer
 This tool was created for educational and authorized testing purposes only. Do not use it on devices you do not own or do not have explicit permission to test.
 ## License 
-GNU General Public License v3.0 (GPLv3). See LICENSE for details.
+MIT. See LICENSE for details.
