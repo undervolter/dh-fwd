@@ -1,4 +1,5 @@
 [14.09.26] dh-fwd v2.2.0
+```md
  - [+] Fallback для TCP Relay (-R) (проверка совместимости)  | TCP relay fallback (-R) (compatibility check)
  - [+] Авто-дроп неактивных портов камеры | Auto-drop inactive ports
  - [+] Переработан механизм реконнекта без нового построения туннеля | Recoded reconnect mechanism without building a new tunnel
@@ -12,10 +13,14 @@
  - [~] fixed: мгновенный выход при занятом локальном порту ("no listeners available") без бесполезных 4-х циклов ретрая | fixed: fast abort on terminal listener bind errors instead of burning retry attempts
  - [~] fixed: инициализация lastRecv текущим временем в NewUDP (предотвращает ложный мгновенный таймаут сокета) | fixed: initialize UDP.lastRecv to time.Now() avoiding false instant timeouts
  - [~] fixed: утечка сокетов в очереди acceptCh при закрытии туннеля | fixed: socket leak in acceptCh during tunnel teardown
-	misc
+```
+misc:
+
+```md
  - [+] Механизм автообновления | Auto upgrade mechanism
  - [+] Немного изменённый UI | A little bit changed UI
  - [~] reworked: Механизм логов - теперь они пишутся не в терминал а в .log |  Log mechanism - now they're writing in .log, not in stdout
+```
 
 [11.09.26] dh-fwd v2.1.1
  - [~] Добавлен механизм повторного соединения в случае если промежуточный сервер не отвечает | Added reconnect mechanism in case the relay server does not respond
