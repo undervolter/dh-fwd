@@ -199,7 +199,9 @@ func main() {
 	var portSpec string
 	var hbTimeout time.Duration
 	var appName string
+	var scanVal scanFlag
 
+	flag.Var(&scanVal, "scan", "scan ports on target device without building local tunnels")
 	flag.BoolVar(&debug, "debug", false, "debug protocol output")
 	flag.BoolVar(&debug, "d", false, "debug protocol output")
 	flag.BoolVar(&infoMode, "info", false, "query /info/device/<SN> and decrypt the Info blob (randsalt, devP2PVersion)")
@@ -210,6 +212,9 @@ func main() {
 	flag.BoolVar(&smartpssPreset, "smart-pss", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
 	flag.IntVar(&poolSize, "pool", 50, "pre-bound realms per forwarded port (default 50; 0 disables pooling)")
 	flag.IntVar(&poolSize, "pools", 50, "pre-bound realms per forwarded port (default 50; 0 disables pooling)")
+	var creds string
+	flag.StringVar(&creds, "creds", "", "credentials in format username:password (sets --type 1)")
+	flag.StringVar(&creds, "c", "", "credentials in format username:password (sets --type 1)")
 	flag.IntVar(&dtype, "t", 0, "device type: 0 = no auth (default), 1 = with auth")
 	flag.IntVar(&dtype, "type", 0, "device type: 0 = no auth (default), 1 = with auth")
 	flag.StringVar(&username, "u", "", "username (required when --type 1)")
@@ -232,6 +237,19 @@ func main() {
 	positional, err := parseArgs(flag.CommandLine, os.Args[1:])
 	if err != nil {
 		os.Exit(2)
+	}
+
+	if creds != "" {
+		parts := strings.SplitN(creds, ":", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			fmt.Fprintln(os.Stderr, "invalid --creds format: expected username:password")
+			os.Exit(1)
+		}
+		username = parts[0]
+		password = parts[1]
+		if dtype == 0 {
+			dtype = 1
+		}
 	}
 
 	_ = initLogger("")
@@ -287,6 +305,23 @@ func main() {
 		fmt.Println("[!] Dahua may not accept TCP connections!")
 	}
 
+	if scanVal.enabled {
+		spec := scanVal.ports
+		if spec == "" && portSpec != "" {
+			spec = portSpec
+		}
+		if spec == "" && len(positional) > 1 {
+			spec = positional[1]
+		}
+		scanPorts, err := parseScanPortList(spec)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "scan ports spec: %v\n", err)
+			os.Exit(1)
+		}
+		runPortScan(serial, prof, scanPorts, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode)
+		return
+	}
+
 	if multi {
 		runMulti(serial, prof, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize)
 	} else {
@@ -299,6 +334,7 @@ func usage() {
        dh-fwd <serial> [options]
 
 General:
+  --scan                          scan ports on device without opening local tunnels
   --debug, -d                     debug protocol output
   --log-retries, -lr              log retry details
   --heartbeat-timeout, -hb <dur>  PTCP heartbeat timeout (default 10s)
@@ -315,12 +351,11 @@ General:
                                   the DMSS app (Dolynk cloud)
 
 Device auth:
+  --creds, -c <user:pass> credentials in format username:password (sets --type 1)
   --type, -t <0|1>        device type: 0 = no auth (default), 1 = with auth
   --username, -u <name>   username (required when --type 1)
   --password, -P <pass>   password (required when --type 1)
-  --randsalt, -s <salt>   RandSalt from the info blob
-                          (not needed with --app dmss — the salt is read
-                          from the device's encrypted Info blob)
+  --randsalt, -s <salt>   RandSalt from the info blob (auto-resolved from device if omitted)
 
 Ports:
   --port, -p <spec>       "local:camera" pairs, e.g. "5080,5081:80,81";
@@ -331,9 +366,10 @@ Ports:
 
 Examples:
   dh-fwd SN -p 5080,5081:80,81
+  dh-fwd SN -c admin:password -p 5080:554
   dh-fwd SN -t 1 -u admin -P undervolter -p 5080:554
-  dh-fwd SN -p 1337:80 --pool 50
-  dh-fwd --app dmss SN -t 1 -u admin -P secret -p 8554:554
+  dh-fwd SN -p 1337:80
+  dh-fwd --app dmss SN -c admin:secret -p 8554:554
 `)
 }
 
@@ -448,6 +484,10 @@ func runSingle(serial string, prof *appProfile, spec PortSpec, dtype int, userna
 		if errors.Is(err, errDeviceNotFound) {
 			os.Exit(1)
 		}
+		if isAuthError(err) {
+			fmt.Fprintf(os.Stderr, "Tunnel failed: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Fprintf(os.Stderr, "Tunnel failed, reason - %v, giving up after %d attempts\n", err, RETRY_ATTEMPTS)
 		os.Exit(1)
 	})
@@ -479,7 +519,7 @@ func verifyDevice(serial string, prof *appProfile, dtype int, username, password
 		return false, randsalt
 	}
 
-	if prof.autoSalt && dtype > 0 && randsalt == "" {
+	if (prof.autoSalt || dtype > 0) && dtype > 0 && randsalt == "" {
 		// Only profiles that resolve the salt from the device dial the US
 		// here; the legacy preflight talks to the main server alone.
 		us, portStr, err := net.SplitHostPort(res.Body["body/US"])
@@ -514,7 +554,15 @@ func verifyDevice(serial string, prof *appProfile, dtype int, username, password
 			window = RELAY_READ_TIMEOUT
 		}
 		if early := waitChannelEarlyAck(u, ch, logf, window); early != nil {
-			return early.Code < 400, randsalt
+			if early.Code >= 400 {
+				if dtype == 0 && early.Code == 403 {
+					fmt.Fprintln(os.Stderr, errDeviceRequireAuth)
+				} else if dtype > 0 && early.Code == 403 {
+					fmt.Fprintln(os.Stderr, errAuthFailed)
+				}
+				return false, randsalt
+			}
+			return true, randsalt
 		}
 	}
 	res, err = u.Read(true, RELAY_READ_TIMEOUT)
@@ -524,7 +572,15 @@ func verifyDevice(serial string, prof *appProfile, dtype int, username, password
 	if err != nil {
 		return false, randsalt
 	}
-	return res.Code < 400, randsalt
+	if res.Code >= 400 {
+		if dtype == 0 && res.Code == 403 {
+			fmt.Fprintln(os.Stderr, errDeviceRequireAuth)
+		} else if dtype > 0 && res.Code == 403 {
+			fmt.Fprintln(os.Stderr, errAuthFailed)
+		}
+		return false, randsalt
+	}
+	return true, randsalt
 }
 
 func distribute(specs []PortSpec, threads int) []specGroup {

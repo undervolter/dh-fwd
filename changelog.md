@@ -1,3 +1,11 @@
+[15.09.26] dh-fwd v2.3
+```md
+ - [+] Нативный P2P-портсканер (--scan) без локального форвардинга | Native P2P port scanner (--scan) without opening local listeners
+ - [+] Защита от рейтлимита: последовательное сканирование с 4-секундной паузой и живым таймером | Rate-limit resilience: sequential scanning with 4s cooldown pacing and live countdown
+ - [~] Упрощённый ввод учётных данных (--creds, -c login:password) | Simplified credential input (--creds, -c login:password)
+ - [~] Автоматическое извлечение RandSalt из зашифрованного Info-блоба камеры | Automatic RandSalt resolution from device encrypted Info blob
+```
+
 [14.09.26] dh-fwd v2.2.0
 ```md
  - [+] Fallback для TCP Relay (-R) (проверка совместимости)  | TCP relay fallback (-R) (compatibility check)

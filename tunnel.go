@@ -59,7 +59,22 @@ var (
 	relayChannelMaxRetransmits  = 3
 )
 
-var errDeviceNotFound = errors.New("device response: code=404 Not Found")
+var (
+	errDeviceNotFound    = errors.New("device response: code=404 Not Found")
+	errDeviceRequireAuth = errors.New("device requires authentication (code=403 Forbidden), specify credentials with --creds <user>:<pass>")
+	errAuthFailed        = errors.New("device authentication failed: check credentials or salt (code=403 Forbidden)")
+)
+
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, errDeviceRequireAuth) ||
+		errors.Is(err, errAuthFailed) ||
+		strings.Contains(err.Error(), "device requires authentication") ||
+		strings.Contains(err.Error(), "device authentication failed") ||
+		strings.Contains(err.Error(), "code=403")
+}
 
 var notFoundPrinted sync.Once
 
@@ -203,6 +218,10 @@ type Tunnel struct {
 	errMu     sync.Mutex
 	failErr   error
 
+	scanMu      sync.Mutex
+	scanWait    map[uint32]chan scanOutcome
+	scanResults map[uint32]chan []byte
+
 	// In-place data-path recovery (SmartPSS parity: the app never rebuilds
 	// the tunnel on the first stall — it re-hits the punch path and keeps
 	// the session). rePunchPacket is the inverted-STUN init captured at
@@ -315,7 +334,14 @@ func (t *Tunnel) reset() {
 	t.setPrimary(nil)
 	t.chanKey = nil
 	t.bindWait = make(map[uint32]chan struct{})
+	t.scanMu.Lock()
+	t.scanWait = make(map[uint32]chan scanOutcome)
+	t.scanResults = make(map[uint32]chan []byte)
+	t.scanMu.Unlock()
 	t.pools = make(map[int]*poolState)
+	if t.forceAppRelay {
+		t.poolTarget = 0
+	}
 	t.failErr = nil
 	t.rePunchMu.Lock()
 	t.rePunchPacket = nil
@@ -831,9 +857,18 @@ func (t *Tunnel) establish() error {
 			return errDeviceNotFound
 		}
 		if t.dtype == 0 && res.Code == 403 {
-			return fmt.Errorf("device requires authentication, try --type 1 --username <user> --password <pass>")
+			return errDeviceRequireAuth
+		}
+		if t.dtype > 0 && res.Code == 403 {
+			return errAuthFailed
 		}
 		return fmt.Errorf("device response: code=%d %s", res.Code, res.Status)
+	}
+
+	if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+		t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+		t.forceAppRelay = true
+		t.poolTarget = 0
 	}
 
 	deviceLaddr := res.Body["body/LocalAddr"]
@@ -912,7 +947,7 @@ func (t *Tunnel) establish() error {
 	// invalidates the channel — BINDs get relay-fabricated 0x12 CONN acks
 	// but DATA is never routed.
 	var sign []byte
-	if agentOK && !t.forceAppRelay {
+	if agentOK {
 		t.statusf(PhaseNATPunch, "PTCP sync")
 		mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 		t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
@@ -933,18 +968,23 @@ func (t *Tunnel) establish() error {
 			return fmt.Errorf("ptcp sync: %v", err)
 		}
 
-		t.statusf(PhaseNATPunch, "PTCP token")
-		mainRemote.RequestPTCP([]byte{
-			0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			0x00, 0x00, 0x00, 0x00,
-		})
-		t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-		p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
-		if err != nil {
-			return fmt.Errorf("ptcp 0x17: %v", err)
-		}
-		sign = p.Body[12:]
+		// Complete the 3-way PTCP handshake by acknowledging the relay's SYNC frame.
 		mainRemote.RequestPTCP(nil)
+
+		if !t.profile.noRelayAuth && !t.forceAppRelay {
+			t.statusf(PhaseNATPunch, "PTCP token")
+			mainRemote.RequestPTCP([]byte{
+				0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00,
+			})
+			t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+			p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
+			if err != nil {
+				return fmt.Errorf("ptcp 0x17: %v", err)
+			}
+			sign = p.Body[12:]
+			mainRemote.RequestPTCP(nil)
+		}
 	}
 
 	// Inverted STUN punch (Level 2): build the Init packet from the AID.
@@ -996,8 +1036,9 @@ func (t *Tunnel) establish() error {
 				if attempt <= 2 {
 					t.logf("Retransmit STUN init (attempt %d)", attempt)
 					deviceRemote.Send(stunInit)
+					continue
 				}
-				continue
+				break
 			}
 			break
 		}
@@ -1190,6 +1231,11 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 		if err == nil {
 			if t.debug {
 				t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
+			}
+			if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+				t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+				t.forceAppRelay = true
+				t.poolTarget = 0
 			}
 			return nil
 		}
@@ -1647,10 +1693,11 @@ func (t *Tunnel) heartbeatLoop(done chan struct{}) {
 			t.socksMu.Lock()
 			mr := t.mainRemote
 			t.socksMu.Unlock()
-			if mr != nil {
+			p := t.getPrimary()
+			if mr != nil && mr != p {
 				mr.RequestPTCP([]byte{})
 			}
-			if p := t.getPrimary(); p != nil {
+			if p != nil {
 				p.RequestPTCP(ptcpHeartbeat)
 			}
 
@@ -1989,9 +2036,16 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 	src.ScheduleAck()
 
 	switch p.Body[0] {
+	case 0x00:
+		// SYNC frame (0x00 0x03 0x01 0x00) — acknowledge immediately
+		src.RequestPTCP(nil)
+		return
 	case 0x10:
 		pl, err := ParsePTCPPayload(p.Body)
 		if err != nil {
+			return
+		}
+		if t.dispatchScanData(pl.Realm, pl.Payload) {
 			return
 		}
 		if c := t.getClient(pl.Realm); c != nil && len(pl.Payload) > 0 {
@@ -1999,6 +2053,10 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 		}
 	case 0x12:
 		realm := binary.BigEndian.Uint32(p.Body[4:8])
+		isDisc := len(p.Body) >= 16 && string(p.Body[12:16]) == "DISC"
+		if t.dispatchScan12(realm, isDisc) {
+			return
+		}
 		if ch := t.takeBindWait(realm); ch != nil {
 			close(ch)
 			return
@@ -2117,6 +2175,7 @@ func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error))
 		// up (live 2026-09-13: a busy :1337 looped the whole establish
 		// sequence four times for nothing).
 		terminal := errors.Is(err, errDeviceNotFound) ||
+			isAuthError(err) ||
 			strings.Contains(err.Error(), "no listeners available")
 		if terminal {
 			if errors.Is(err, errDeviceNotFound) {
@@ -2256,7 +2315,7 @@ func resolveAutoSalt(prof *appProfile, dtype int, randsalt string, payload []byt
 		}
 		return randsalt, nil
 	}
-	if !prof.autoSalt || dtype == 0 || randsalt != "" {
+	if dtype == 0 || randsalt != "" {
 		return randsalt, nil
 	}
 	salt, err := randsaltFromInfo(payload)
@@ -2397,3 +2456,43 @@ func isMostlyPrintable(b []byte) bool {
 	}
 	return ok*100/len(b) > 90
 }
+
+type scanOutcome int
+
+const (
+	scanOutcomeConn scanOutcome = iota
+	scanOutcomeDisc
+)
+
+func (t *Tunnel) dispatchScanData(realm uint32, payload []byte) bool {
+	t.scanMu.Lock()
+	ch := t.scanResults[realm]
+	t.scanMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- payload:
+		default:
+		}
+		return true
+	}
+	return false
+}
+
+func (t *Tunnel) dispatchScan12(realm uint32, isDisc bool) bool {
+	t.scanMu.Lock()
+	ch := t.scanWait[realm]
+	t.scanMu.Unlock()
+	if ch != nil {
+		outcome := scanOutcomeConn
+		if isDisc {
+			outcome = scanOutcomeDisc
+		}
+		select {
+		case ch <- outcome:
+		default:
+		}
+		return true
+	}
+	return false
+}
+

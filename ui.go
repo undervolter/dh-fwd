@@ -209,3 +209,107 @@ func (cp *ConnectProgress) render() {
 	}
 	fmt.Fprintf(cp.w, "\r%s", line)
 }
+
+// ---------------------------------------------------------------------------
+// ScanProgress: in-place progress line for port scanning.
+// Renders: Scanning SN [=========>             ] 45 % | port 37777 (5/15)
+// ---------------------------------------------------------------------------
+
+type ScanProgress struct {
+	mu      sync.Mutex
+	w       io.Writer
+	serial  string
+	total   int
+	done    int
+	current string
+}
+
+func NewScanProgress(w io.Writer, serial string, total int) *ScanProgress {
+	sp := &ScanProgress{
+		w:      w,
+		serial: serial,
+		total:  total,
+	}
+	sp.render()
+	return sp
+}
+
+func (sp *ScanProgress) UpdateScanning(doneIdx int, currentPort int) {
+	sp.mu.Lock()
+	sp.done = doneIdx
+	sp.current = fmt.Sprintf("port %d (%d/%d)", currentPort, doneIdx+1, sp.total)
+	sp.mu.Unlock()
+	sp.render()
+}
+
+func (sp *ScanProgress) UpdateWaiting(doneCount int, lastPort int, state string, secondsLeft int) {
+	sp.mu.Lock()
+	sp.done = doneCount
+	sp.current = fmt.Sprintf("port %d (%s) — wait %ds...", lastPort, state, secondsLeft)
+	sp.mu.Unlock()
+	sp.render()
+}
+
+func (sp *ScanProgress) Update(done int, currentPort int) {
+	sp.mu.Lock()
+	sp.done = done
+	if currentPort > 0 {
+		sp.current = fmt.Sprintf("port %d (%d/%d)", currentPort, done, sp.total)
+	} else {
+		sp.current = fmt.Sprintf("(%d/%d)", done, sp.total)
+	}
+	sp.mu.Unlock()
+	sp.render()
+}
+
+func (sp *ScanProgress) Done() {
+	sp.mu.Lock()
+	sp.done = sp.total
+	sp.current = "scan complete"
+	sp.mu.Unlock()
+	sp.render()
+	fmt.Fprintln(sp.w)
+}
+
+func (sp *ScanProgress) render() {
+	sp.mu.Lock()
+	done := sp.done
+	total := sp.total
+	serial := sp.serial
+	curr := sp.current
+	sp.mu.Unlock()
+
+	pct := 0
+	if total > 0 {
+		pct = done * 100 / total
+	}
+	if pct > 100 {
+		pct = 100
+	}
+
+	filled := 0
+	if total > 0 {
+		filled = done * cpBarWidth / total
+	}
+	if filled > cpBarWidth {
+		filled = cpBarWidth
+	}
+
+	var bar string
+	if filled >= cpBarWidth {
+		bar = strings.Repeat("=", cpBarWidth-1) + ">"
+	} else {
+		spaces := cpBarWidth - 1 - filled
+		if spaces < 0 {
+			spaces = 0
+		}
+		bar = strings.Repeat("=", filled) + ">" + strings.Repeat(" ", spaces)
+	}
+
+	line := fmt.Sprintf("Scanning %s [%s] %3d %% | %s", serial, bar, pct, curr)
+	if len(line) < 110 {
+		line += strings.Repeat(" ", 110-len(line))
+	}
+	fmt.Fprintf(sp.w, "\r%s", line)
+}
+

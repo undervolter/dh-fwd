@@ -18,6 +18,7 @@ func TestParseArgs(t *testing.T) {
 		wantType      int
 		wantUser      string
 		wantPass      string
+		wantCreds     string
 		wantSalt      string
 		wantSmartpss  bool
 		wantPool      int
@@ -74,6 +75,24 @@ func TestParseArgs(t *testing.T) {
 			wantUser:      "admin",
 			wantPass:      "secret",
 			wantSalt:      "salt123",
+			wantPool:      50,
+			wantThreads:   3,
+			wantHBTimeout: 10 * time.Second,
+		},
+		{
+			name:          "creds short flag",
+			args:          []string{"-c", "admin:secret", "ABC123456"},
+			wantPos:       []string{"ABC123456"},
+			wantCreds:     "admin:secret",
+			wantPool:      50,
+			wantThreads:   3,
+			wantHBTimeout: 10 * time.Second,
+		},
+		{
+			name:          "creds long flag",
+			args:          []string{"--creds", "admin:secret", "ABC123456"},
+			wantPos:       []string{"ABC123456"},
+			wantCreds:     "admin:secret",
 			wantPool:      50,
 			wantThreads:   3,
 			wantHBTimeout: 10 * time.Second,
@@ -149,6 +168,9 @@ func TestParseArgs(t *testing.T) {
 			fs.BoolVar(&smartpssPreset, "smart-pss", false, "")
 			fs.IntVar(&poolSize, "pool", 50, "")
 			fs.IntVar(&poolSize, "pools", 50, "")
+			var creds string
+			fs.StringVar(&creds, "creds", "", "")
+			fs.StringVar(&creds, "c", "", "")
 			fs.IntVar(&dtype, "t", 0, "")
 			fs.IntVar(&dtype, "type", 0, "")
 			fs.StringVar(&username, "u", "", "")
@@ -175,6 +197,9 @@ func TestParseArgs(t *testing.T) {
 			}
 			if debug != tc.wantDebug {
 				t.Errorf("debug: got %v, want %v", debug, tc.wantDebug)
+			}
+			if creds != tc.wantCreds {
+				t.Errorf("creds: got %v, want %v", creds, tc.wantCreds)
 			}
 			if portSpec != tc.wantPortSpec {
 				t.Errorf("portSpec: got %v, want %v", portSpec, tc.wantPortSpec)

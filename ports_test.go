@@ -175,3 +175,47 @@ func TestPoolFIFO(t *testing.T) {
 		t.Fatalf("drop failed: %d", len(tr.pools[80].queue))
 	}
 }
+
+func TestParseScanPortList(t *testing.T) {
+	// Default
+	ports, err := parseScanPortList("")
+	if err != nil || len(ports) != len(defaultScanPorts) {
+		t.Fatalf("empty input should return defaultScanPorts, got %v err %v", ports, err)
+	}
+
+	// Custom list
+	ports, err = parseScanPortList("80,443,554")
+	if err != nil || len(ports) != 3 || ports[0] != 80 || ports[1] != 443 || ports[2] != 554 {
+		t.Fatalf("custom list failed: got %v err %v", ports, err)
+	}
+
+	// Range
+	ports, err = parseScanPortList("80-83")
+	if err != nil || len(ports) != 4 || ports[0] != 80 || ports[3] != 83 {
+		t.Fatalf("range list failed: got %v err %v", ports, err)
+	}
+
+	// With colon prefix (like 0:80,81)
+	ports, err = parseScanPortList("0:80,81")
+	if err != nil || len(ports) != 2 || ports[0] != 80 || ports[1] != 81 {
+		t.Fatalf("colon list failed: got %v err %v", ports, err)
+	}
+}
+
+func TestScanFlag(t *testing.T) {
+	var sf scanFlag
+	if sf.IsBoolFlag() != true {
+		t.Fatal("expected IsBoolFlag to be true")
+	}
+
+	_ = sf.Set("true")
+	if !sf.enabled || sf.ports != "" {
+		t.Fatalf("expected enabled=true, ports empty, got enabled=%v ports=%q", sf.enabled, sf.ports)
+	}
+
+	_ = sf.Set("80,37777")
+	if !sf.enabled || sf.ports != "80,37777" {
+		t.Fatalf("expected ports='80,37777', got %q", sf.ports)
+	}
+}
+
