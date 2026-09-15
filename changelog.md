@@ -1,10 +1,6 @@
 [16.09.26] dh-fwd v2.3.1
 ```md
- - [~] fixed: обрезание концов HTTP-ответов (JS/CSS) из-за несохранённого буфера coalesce при закрытии канала (0x12 DVR DISC) | fixed: truncated HTTP responses (JS/CSS assets) caused by unflushed coalesce buffer on channel close (0x12 DVR DISC)
- - [~] fixed: зависание передачи больших файлов (ext-all.js) из-за задержки ACK (ScheduleAck) при исчерпании окна DVR | fixed: large file download stalls (ext-all.js) caused by delayed ACK deadlock (ScheduleAck) under full DVR window
- - [+] Ретрансмиты BIND-запросов (каждые 400мс) при потере UDP-пакетов под параллельной нагрузкой браузера | BIND request retransmits (400ms ticker) preventing false timeouts on simultaneous browser connections
- - [+] HTTP-акселератор для порта 80: многопоточная загрузка тяжелых веб-ресурсов (JS/CSS) через параллельные Range-запросы из пула реалмов с бесшовной сборкой (~5x ускорение) | HTTP accelerator for port 80: multi-threaded asset fetching via parallel Range chunks and pooled realms with seamless reassembly (~5x speedup)
- - [+] Предупреждение о нестабильности релейного канала: "[!] Using relay path (unstable). Proceed? (y/n)" с ключом -y/--yes | Warning for relay path instability: "[!] Using relay path (unstable). Proceed? (y/n)" with -y/--yes flag
+ - [+] Предупреждение о нестабильности релейного канала | Warning for relay path instability
 ```
 
 [15.09.26] dh-fwd v2.3
