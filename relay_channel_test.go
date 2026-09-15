@@ -14,7 +14,7 @@ func TestWaitRelayChannelAckImmediate(t *testing.T) {
 	prof.mainPort = p.port
 
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{{Local: 0, Remote: 554}}}
-	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, g, nil)
+	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, false, g, nil)
 	defer tt.close()
 
 	origInterval, origRetrans := relayChannelRetransInterval, relayChannelMaxRetransmits
@@ -51,7 +51,7 @@ func TestWaitRelayChannelAckRetransmitOnTimeout(t *testing.T) {
 	prof.mainPort = p.port
 
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{{Local: 0, Remote: 554}}}
-	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, g, nil)
+	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, false, g, nil)
 	defer tt.close()
 
 	origInterval, origRetrans := relayChannelRetransInterval, relayChannelMaxRetransmits
@@ -110,7 +110,7 @@ func TestWaitRelayChannelAckExhausted(t *testing.T) {
 	prof.mainPort = p.port
 
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{{Local: 0, Remote: 554}}}
-	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, g, nil)
+	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, false, g, nil)
 	defer tt.close()
 
 	origInterval, origRetrans := relayChannelRetransInterval, relayChannelMaxRetransmits

@@ -72,7 +72,7 @@ func ptcpBodies(p *dhTestPeer) (binds, datas int) {
 
 func newBindTestTunnel(t *testing.T, prof *appProfile, p *dhTestPeer) *Tunnel {
 	t.Helper()
-	tt := newTunnel("SN123", prof, 0, "", "", "", false, false, false, 0, specGroup{}, nil)
+	tt := newTunnel("SN123", prof, 0, "", "", "", false, false, false, 0, false, specGroup{}, nil)
 	u := NewUDP("127.0.0.1", p.port, false, prof)
 	t.Cleanup(u.Close)
 	tt.primary = u
@@ -139,7 +139,7 @@ func TestNewTunnelPoolDisabledForNoRelayAuth(t *testing.T) {
 	if !dmss.noRelayAuth {
 		t.Fatal("dmss profile must set noRelayAuth (app relay dialect: no 0x17/0x19)")
 	}
-	tt := newTunnel("SN123", &dmss, 0, "", "", "", false, false, false, 50, specGroup{}, nil)
+	tt := newTunnel("SN123", &dmss, 0, "", "", "", false, false, false, 50, false, specGroup{}, nil)
 	if tt.poolTarget != 0 {
 		t.Fatalf("dmss tunnel must disable the realm pool, got poolTarget=%d", tt.poolTarget)
 	}
@@ -147,8 +147,31 @@ func TestNewTunnelPoolDisabledForNoRelayAuth(t *testing.T) {
 	if sp.noRelayAuth {
 		t.Fatal("smartpss profile must keep the 0x17/0x19 handshake (upstream dialect)")
 	}
-	tt2 := newTunnel("SN123", &sp, 0, "", "", "", false, false, false, 50, specGroup{}, nil)
+	tt2 := newTunnel("SN123", &sp, 0, "", "", "", false, false, false, 50, false, specGroup{}, nil)
 	if tt2.poolTarget != 50 {
 		t.Fatalf("smartpss tunnel must keep the requested pool level, got poolTarget=%d", tt2.poolTarget)
+	}
+}
+
+// An explicit --pool level wins over every automatic pool disable:
+// noRelayAuth profiles, the 2024+ forceAppRelay switch and reset().
+func TestNewTunnelExplicitPoolWins(t *testing.T) {
+	dmss := *dmssProfile
+	tt := newTunnel("SN123", &dmss, 0, "", "", "", false, false, false, 50, true, specGroup{}, nil)
+	if tt.poolTarget != 50 {
+		t.Fatalf("explicit pool must survive the noRelayAuth disable, got poolTarget=%d", tt.poolTarget)
+	}
+	sp := *smartpssProfile
+	tt2 := newTunnel("SN123", &sp, 0, "", "", "", false, false, false, 50, true, specGroup{}, nil)
+	tt2.forceAppRelay = true
+	tt2.reset()
+	if tt2.poolTarget != 50 {
+		t.Fatalf("explicit pool must survive forceAppRelay reset, got poolTarget=%d", tt2.poolTarget)
+	}
+	tt3 := newTunnel("SN123", &sp, 0, "", "", "", false, false, false, 50, false, specGroup{}, nil)
+	tt3.forceAppRelay = true
+	tt3.reset()
+	if tt3.poolTarget != 0 {
+		t.Fatalf("implicit pool must still be disabled by forceAppRelay reset, got poolTarget=%d", tt3.poolTarget)
 	}
 }

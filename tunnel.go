@@ -157,11 +157,20 @@ func (c *Client) flushNow() {
 	c.flushMu.Lock()
 	out := c.pending
 	c.pending = nil
-	c.flushTimer = nil
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+		c.flushTimer = nil
+	}
 	c.flushMu.Unlock()
 	if len(out) > 0 {
 		c.conn.Write(out)
 	}
+}
+
+// close drains any remaining buffered data to the local client before closing.
+func (c *Client) close() {
+	c.flushNow()
+	c.conn.Close()
 }
 
 type acceptConn struct {
@@ -256,6 +265,11 @@ type Tunnel struct {
 	poolMu     sync.Mutex
 	pools      map[int]*poolState
 	poolTarget int
+	// poolExplicit is true when the level came from an explicit --pool flag:
+	// it wins over every automatic pool disable (noRelayAuth profiles,
+	// 2024+ forceAppRelay). The operator asked for it — honor it, even if
+	// pre-bound realms may go stale device-side on those dialects.
+	poolExplicit bool
 }
 
 // poolState is the per-port pool. All fields guarded by poolMu.
@@ -285,12 +299,13 @@ func (t *Tunnel) setPrimaryRelay(u *UDP) {
 	t.setPrimary(u)
 }
 
-func newTunnel(serial string, prof *appProfile, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, g specGroup, reg *PortRegistry) *Tunnel {
+func newTunnel(serial string, prof *appProfile, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, poolExplicit bool, g specGroup, reg *PortRegistry) *Tunnel {
 	// The app relay dialect binds each realm FRESH, seconds before use
 	// (capture: BIND †’ 0x12 CONN †’ DATA, ~6 ms apart). Pre-bound realms go
 	// stale device-side and their DATA is discarded, so pooling is disabled
-	// for noRelayAuth profiles regardless of --pool.
-	if prof != nil && prof.noRelayAuth && poolSize > 0 {
+	// for noRelayAuth profiles — UNLESS the operator passed --pool
+	// explicitly (poolExplicit): an explicit level always wins.
+	if prof != nil && prof.noRelayAuth && poolSize > 0 && !poolExplicit {
 		poolSize = 0
 	}
 	t := &Tunnel{
@@ -304,6 +319,7 @@ func newTunnel(serial string, prof *appProfile, dtype int, username, password, r
 		logRetries:  logRetries,
 		useTCP:      forceTCP,
 		poolTarget:  poolSize,
+		poolExplicit: poolExplicit,
 		specs:       g.specs,
 		specIdx:     g.idxs,
 		reg:         reg,
@@ -339,7 +355,7 @@ func (t *Tunnel) reset() {
 	t.scanResults = make(map[uint32]chan []byte)
 	t.scanMu.Unlock()
 	t.pools = make(map[int]*poolState)
-	if t.forceAppRelay {
+	if t.forceAppRelay && !t.poolExplicit {
 		t.poolTarget = 0
 	}
 	t.failErr = nil
@@ -374,7 +390,7 @@ func (t *Tunnel) close() {
 	}
 	t.clientsMu.Lock()
 	for _, c := range t.clients {
-		c.conn.Close()
+		c.close()
 	}
 	t.clientsMu.Unlock()
 	t.socksMu.Lock()
@@ -866,9 +882,13 @@ func (t *Tunnel) establish() error {
 	}
 
 	if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
-		t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
 		t.forceAppRelay = true
-		t.poolTarget = 0
+		if t.poolExplicit {
+			t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
+		} else {
+			t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+			t.poolTarget = 0
+		}
 	}
 
 	deviceLaddr := res.Body["body/LocalAddr"]
@@ -1233,9 +1253,13 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 				t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
 			}
 			if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
-				t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
 				t.forceAppRelay = true
-				t.poolTarget = 0
+				if t.poolExplicit {
+					t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
+				} else {
+					t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
+					t.poolTarget = 0
+				}
 			}
 			return nil
 		}
@@ -1854,6 +1878,19 @@ func (t *Tunnel) poolKeeper(done chan struct{}, remotePort int) {
 // In TCP-relay mode the realm is a TOU session opened with a SYN frame.
 // On the UDP path a pooled pre-bound realm is preferred: no BIND wait.
 func (t *Tunnel) handleBind(ac acceptConn) {
+	// HTTP accelerator: for port-80 connections, try parallel Range fetch to
+	// overcome relay bandwidth limits (~59 KB/s per realm → ~295 KB/s with 5).
+	// Only on the UDP data path; TCP relay has its own flow control.
+	if ac.remotePort == 80 && !t.useTCPPath {
+		res := t.httpAccelHandler(ac.conn)
+		if res.handled {
+			return
+		}
+		if res.replacement != nil {
+			ac.conn = res.replacement
+		}
+	}
+
 	if !t.useTCPPath {
 		if realmID, ok := t.popRealm(ac.remotePort); ok {
 			t.logf("Realm pool: hit realm=%#010x port=%d", realmID, ac.remotePort)
@@ -1908,21 +1945,37 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	time.Sleep(10 * time.Millisecond)
 	t.bindReqMu.Unlock()
 
-	select {
-	case <-wait:
-		t.logf("Bind OK realm=%#010x in %v", realmID, time.Since(bindStart))
-		// App parity (capture 2026-09-06): DATA flows only AFTER the realm
-		// is confirmed (0x12 CONN). Wiring the client before the bind
-		// pushed realm DATA ahead of the BIND — the device answers that
-		// with an immediate 0x12 DISC.
-		t.addClient(realmID, ac.conn, ac.remotePort)
-	case <-time.After(BIND_TIMEOUT):
-		t.logf("Bind FAILED realm=%#010x port=%d", realmID, ac.remotePort)
-		ac.conn.Close()
-		t.takeBindWait(realmID)
-	case <-t.done:
-		t.takeBindWait(realmID)
-		ac.conn.Close()
+	bindTicker := time.NewTicker(400 * time.Millisecond)
+	defer bindTicker.Stop()
+	bindTimer := time.NewTimer(BIND_TIMEOUT)
+	defer bindTimer.Stop()
+
+	for {
+		select {
+		case <-wait:
+			t.logf("Bind OK realm=%#010x in %v", realmID, time.Since(bindStart))
+			// App parity (capture 2026-09-06): DATA flows only AFTER the realm
+			// is confirmed (0x12 CONN). Wiring the client before the bind
+			// pushed realm DATA ahead of the BIND — the device answers that
+			// with an immediate 0x12 DISC.
+			t.addClient(realmID, ac.conn, ac.remotePort)
+			return
+		case <-bindTicker.C:
+			t.bindReqMu.Lock()
+			if p := t.getPrimary(); p != nil {
+				p.RequestPTCP(bindPkt)
+			}
+			t.bindReqMu.Unlock()
+		case <-bindTimer.C:
+			t.logf("Bind FAILED realm=%#010x port=%d", realmID, ac.remotePort)
+			ac.conn.Close()
+			t.takeBindWait(realmID)
+			return
+		case <-t.done:
+			t.takeBindWait(realmID)
+			ac.conn.Close()
+			return
+		}
 	}
 }
 
@@ -1964,8 +2017,12 @@ func (t *Tunnel) getClient(realmID uint32) *Client {
 
 func (t *Tunnel) delClient(realmID uint32) {
 	t.clientsMu.Lock()
+	c := t.clients[realmID]
 	delete(t.clients, realmID)
 	t.clientsMu.Unlock()
+	if c != nil {
+		c.flushNow()
+	}
 }
 
 // dataSegmentMax matches the device's own segmentation observed in the
@@ -2063,7 +2120,7 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 		}
 		t.dropRealm(realm) // device discarded a pooled realm
 		if c := t.getClient(realm); c != nil {
-			c.conn.Close()
+			c.close()
 			t.delClient(realm)
 			t.logf("DVR DISC realm=%#010x", realm)
 		}
@@ -2469,8 +2526,10 @@ func (t *Tunnel) dispatchScanData(realm uint32, payload []byte) bool {
 	ch := t.scanResults[realm]
 	t.scanMu.Unlock()
 	if ch != nil {
+		cp := make([]byte, len(payload))
+		copy(cp, payload)
 		select {
-		case ch <- payload:
+		case ch <- cp:
 		default:
 		}
 		return true
@@ -2481,6 +2540,13 @@ func (t *Tunnel) dispatchScanData(realm uint32, payload []byte) bool {
 func (t *Tunnel) dispatchScan12(realm uint32, isDisc bool) bool {
 	t.scanMu.Lock()
 	ch := t.scanWait[realm]
+	dataCh := t.scanResults[realm]
+	if isDisc && dataCh != nil {
+		select {
+		case dataCh <- nil:
+		default:
+		}
+	}
 	t.scanMu.Unlock()
 	if ch != nil {
 		outcome := scanOutcomeConn

@@ -1,9 +1,20 @@
+[16.09.26] dh-fwd v2.3.1
+```md
+ - [~] fixed: обрезание концов HTTP-ответов (JS/CSS) из-за несохранённого буфера coalesce при закрытии канала (0x12 DVR DISC) | fixed: truncated HTTP responses (JS/CSS assets) caused by unflushed coalesce buffer on channel close (0x12 DVR DISC)
+ - [~] fixed: зависание передачи больших файлов (ext-all.js) из-за задержки ACK (ScheduleAck) при исчерпании окна DVR | fixed: large file download stalls (ext-all.js) caused by delayed ACK deadlock (ScheduleAck) under full DVR window
+ - [+] Ретрансмиты BIND-запросов (каждые 400мс) при потере UDP-пакетов под параллельной нагрузкой браузера | BIND request retransmits (400ms ticker) preventing false timeouts on simultaneous browser connections
+ - [+] HTTP-акселератор для порта 80: многопоточная загрузка тяжелых веб-ресурсов (JS/CSS) через параллельные Range-запросы из пула реалмов с бесшовной сборкой (~5x ускорение) | HTTP accelerator for port 80: multi-threaded asset fetching via parallel Range chunks and pooled realms with seamless reassembly (~5x speedup)
+ - [+] Предупреждение о нестабильности релейного канала: "[!] Using relay path (unstable). Proceed? (y/n)" с ключом -y/--yes | Warning for relay path instability: "[!] Using relay path (unstable). Proceed? (y/n)" with -y/--yes flag
+```
+
 [15.09.26] dh-fwd v2.3
 ```md
  - [+] Нативный P2P-портсканер (--scan) без локального форвардинга | Native P2P port scanner (--scan) without opening local listeners
  - [+] Защита от рейтлимита: последовательное сканирование с 4-секундной паузой и живым таймером | Rate-limit resilience: sequential scanning with 4s cooldown pacing and live countdown
  - [~] Упрощённый ввод учётных данных (--creds, -c login:password) | Simplified credential input (--creds, -c login:password)
- - [~] Автоматическое извлечение RandSalt из зашифрованного Info-блоба камеры | Automatic RandSalt resolution from device encrypted Info blob
+ - [+] Автоматическое извлечение RandSalt из зашифрованного Info-блоба камеры | Automatic RandSalt resolution from device encrypted Info blob
+ - [~] fixed: моментальный разрыв соединения при ошибке авторизации (403 Forbidden) без долгих бесполезных ретраев | fixed: instant termination on auth failure (403 Forbidden) without wasting retry attempts
+ - [~] fixed: корректное определение открытых портов (0x12 CONN / DISC) без отправки деструктивных служебных пакетов | fixed: reliable open/closed port detection based on 0x12 CONN/DISC without destructive probe payloads
 ```
 
 [14.09.26] dh-fwd v2.2.0

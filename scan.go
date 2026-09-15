@@ -167,7 +167,7 @@ func (t *Tunnel) scanSinglePort(targetPort int) bool {
 func runPortScan(serial string, prof *appProfile, ports []int, dtype int, username, password, randsalt string, debug, logRetries, tcpRelay bool) {
 	// Dummy spec to initialize tunnel data path
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{{Local: 0, Remote: 37777}}}
-	t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, 0, g, nil)
+	t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, 0, false, g, nil)
 
 	cp := NewConnectProgress(os.Stdout, serial)
 	t.progress = cp

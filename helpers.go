@@ -697,7 +697,7 @@ const (
 	// of 1280-byte DATA frames per second; acking each one separately
 	// doubles the datagram rate and eats upstream bandwidth on chatty+bulk
 	// combinations. Cumulative byte-acks (Llid) make delayed acks safe.
-	ackEvery = 4
+	ackEvery = 1
 	ackDelay = 10 * time.Millisecond
 )
 

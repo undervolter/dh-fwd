@@ -370,7 +370,7 @@ func newLocalChannelTunnel(t *testing.T, p *dhTestPeer) *Tunnel {
 	prof := *dmssProfile
 	prof.mainServer = "127.0.0.1"
 	prof.mainPort = p.port
-	tt := newTunnel("SN123", &prof, 1, "admin", "pw", testSalt, false, false, false, 0, specGroup{}, nil)
+	tt := newTunnel("SN123", &prof, 1, "admin", "pw", testSalt, false, false, false, 0, false, specGroup{}, nil)
 	tt.chanKey = getDeriveKey("admin", "pw", testSalt)
 	t.Cleanup(tt.close)
 	return tt
@@ -449,7 +449,7 @@ func TestHandshakeKeepsInputSaltAgainstInfoBlob(t *testing.T) {
 			RELAY_READ_TIMEOUT = 250 * time.Millisecond
 			defer func() { RELAY_READ_TIMEOUT = orig }()
 
-			tt := newTunnel("SN123", prof, 1, "admin", "pw", tc.salt, false, false, false, 0, specGroup{}, nil)
+			tt := newTunnel("SN123", prof, 1, "admin", "pw", tc.salt, false, false, false, 0, false, specGroup{}, nil)
 			defer tt.close()
 
 			// The scripted peer drops PTCP frames, so the handshake fails at
@@ -748,7 +748,7 @@ func TestHandshakeSmartPSSUpstreamSequence(t *testing.T) {
 	defer func() { RELAY_READ_TIMEOUT = orig }()
 
 	g := specGroup{idxs: []int{0, 1}, specs: []PortSpec{{Local: 0, Remote: 80}, {Local: 0, Remote: 37777}}}
-	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, g, nil)
+	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, false, g, nil)
 	defer tt.close()
 
 	// The scripted peer answers every DH request but drops PTCP frames, so

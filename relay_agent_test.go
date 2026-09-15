@@ -68,7 +68,7 @@ func newAgentTestTunnel(t *testing.T, p *dhTestPeer, debug bool) *Tunnel {
 	t.Cleanup(func() { relayLookupTimeout, relayAgentTimeout = origLookup, origAgent })
 
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{{Local: 0, Remote: 554}}}
-	tt := newTunnel("SN123", prof, 1, "admin", "pw", testSalt, debug, false, false, 0, g, nil)
+	tt := newTunnel("SN123", prof, 1, "admin", "pw", testSalt, debug, false, false, 0, false, g, nil)
 	t.Cleanup(tt.close)
 	return tt
 }
@@ -177,7 +177,7 @@ func TestHandshakeSmartPSSAgentStillFatalWhenSilent(t *testing.T) {
 	defer func() { RELAY_READ_TIMEOUT = orig }()
 
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{{Local: 0, Remote: 554}}}
-	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, g, nil)
+	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, false, g, nil)
 	defer tt.close()
 
 	answerDirectPath(p, func(raw string) bool { return strings.Contains(raw, "/relay/agent") })
@@ -241,7 +241,7 @@ func TestHandshakeSmartPSSDispatcherStillFatalWhenSilent(t *testing.T) {
 	defer func() { RELAY_READ_TIMEOUT = orig }()
 
 	g := specGroup{idxs: []int{0}, specs: []PortSpec{{Local: 0, Remote: 554}}}
-	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, g, nil)
+	tt := newTunnel("SN123", &prof, 0, "", "", "", false, false, false, 0, false, g, nil)
 	defer tt.close()
 
 	answerDirectPath(p, func(raw string) bool { return strings.Contains(raw, "/online/relay") })

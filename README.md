@@ -47,7 +47,7 @@ go build -o dh-fwd .
 | --debug | -d | Verbose protocol debug output (requests, STUN packets, PTCP frames) |
 | --port | -p | Port mapping (see below) |
 | --threads | -mt | Number of threads (default 3) |
-| --pool | - | Counter of pools |
+| --pool | - | Counter of pools (an explicit value wins over the automatic pool disable on 2024+ devices) |
 | --smart-pss | -2 | Forwards ports 80 and 37777 at the same time |
 | `--app dmss/smartpss` | `-` | Profile to choose (smartpss or dmss) |
 | --tcp-relay | -R | Force TCP-relay data path |
