@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go" alt="Go">
   <img src="https://img.shields.io/github/v/release/undervolter/dh-fwd?style=flat-square&color=blue" alt="Release">
   <img src="https://img.shields.io/github/license/undervolter/dh-fwd?style=flat-square" alt="License">
+  <img src="https://img.shields.io/github/downloads/undervolter/dh-fwd/total?style=flat-square&color=blue" alt="Downloads">
 </p>
 
 Software for creating tunnels to a Dahua camera (by serial number), forwarding any port to localhost via the Dahua cloud protocol.
