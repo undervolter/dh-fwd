@@ -199,9 +199,7 @@ func main() {
 	var portSpec string
 	var hbTimeout time.Duration
 	var appName string
-	var scanVal scanFlag
 
-	flag.Var(&scanVal, "scan", "scan ports on target device without building local tunnels")
 	flag.BoolVar(&debug, "debug", false, "debug protocol output")
 	flag.BoolVar(&debug, "d", false, "debug protocol output")
 	flag.BoolVar(&infoMode, "info", false, "query /info/device/<SN> and decrypt the Info blob (randsalt, devP2PVersion)")
@@ -255,15 +253,32 @@ func main() {
 		}
 	}
 
+	initTerminal()
 	_ = initLogger("")
 	defer closeLogger()
 
 	HEARTBEAT_TIMEOUT = hbTimeout
 
-	prof, err := profileByName(appName)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		os.Exit(1)
+	// Detect whether --app was explicitly set by the operator.
+	appExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "app" {
+			appExplicit = true
+		}
+	})
+
+	// Build the profile list: explicit --app -> single profile, no fallback;
+	// default -> try smartpss then dmss (auto-detect).
+	var profiles []*appProfile
+	if appExplicit {
+		p, err := profileByName(appName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
+			os.Exit(1)
+		}
+		profiles = []*appProfile{p}
+	} else {
+		profiles = profileFallbackOrder()
 	}
 
 	if len(positional) < 1 {
@@ -273,7 +288,7 @@ func main() {
 	serial := positional[0]
 
 	if infoMode {
-		os.Exit(queryDeviceInfo(serial, prof, debug))
+		os.Exit(queryDeviceInfo(serial, profiles[0], debug))
 	}
 
 	if dtype > 0 && (username == "" || password == "") {
@@ -309,7 +324,7 @@ func main() {
 	}
 
 	if !autoYes {
-		fmt.Print("[!] Using relay path (unstable). Proceed? (y/n) ")
+		fmt.Print("\033[31m[!]\033[0m Using relay path (unstable). Proceed? (y/n) ")
 		reader := bufio.NewReader(os.Stdin)
 		ans, err := reader.ReadString('\n')
 		if err != nil {
@@ -322,30 +337,14 @@ func main() {
 	}
 
 	if tcpRelayMode {
-		fmt.Println("[!] Dahua may not accept TCP connections!")
+		fmt.Println("\033[31m[!]\033[0m Dahua may not accept TCP connections!")
 	}
 
-	if scanVal.enabled {
-		spec := scanVal.ports
-		if spec == "" && portSpec != "" {
-			spec = portSpec
-		}
-		if spec == "" && len(positional) > 1 {
-			spec = positional[1]
-		}
-		scanPorts, err := parseScanPortList(spec)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "scan ports spec: %v\n", err)
-			os.Exit(1)
-		}
-		runPortScan(serial, prof, scanPorts, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode)
-		return
-	}
 
 	if multi {
-		runMulti(serial, prof, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit)
+		runMulti(serial, profiles, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit)
 	} else {
-		runSingle(serial, prof, specs[0], dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit)
+		runSingle(serial, profiles, specs[0], dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit)
 	}
 }
 
@@ -355,7 +354,6 @@ func usage() {
 
 General:
   --yes, -y                       skip confirmation prompts
-  --scan                          scan ports on device without opening local tunnels
   --debug, -d                     debug protocol output
   --log-retries, -lr              log retry details
   --heartbeat-timeout, -hb <dur>  PTCP heartbeat timeout (default 10s)
@@ -499,22 +497,57 @@ func makePortSpecs(locals, remotes []int) ([]PortSpec, error) {
 	return specs, nil
 }
 
-func runSingle(serial string, prof *appProfile, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool) {
-	g := specGroup{idxs: []int{0}, specs: []PortSpec{spec}}
-	t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, poolExplicit, g, nil)
-	cp := NewConnectProgress(os.Stdout, fmt.Sprintf("%s:%d", serial, spec.Remote))
-	t.progress = cp
-	runWithRetries(t, cp, func(err error) {
-		if errors.Is(err, errDeviceNotFound) {
+func runSingle(serial string, profiles []*appProfile, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool) {
+	target := fmt.Sprintf("%s:%d", serial, spec.Remote)
+	showHeader := len(profiles) > 1
+
+	for pi, prof := range profiles {
+		if showHeader && pi == 0 {
+			fmt.Printf("[%d/%d] Trying %s profile\n", pi+1, len(profiles), prof.displayName())
+		}
+
+		g := specGroup{idxs: []int{0}, specs: []PortSpec{spec}}
+		t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, poolExplicit, g, nil)
+		cp := NewConnectProgress(os.Stdout, target)
+		t.progress = cp
+
+		var got404 bool
+		runWithRetries(t, cp, func(err error) {
+			if errors.Is(err, errDeviceNotFound) {
+				got404 = true
+				return
+			}
+			if isAuthError(err) {
+				fmt.Fprintf(os.Stderr, "Tunnel failed: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Fprintf(os.Stderr, "Tunnel failed, reason - %v, giving up after %d attempts\n", err, RETRY_ATTEMPTS)
+			os.Exit(1)
+		})
+
+		if !got404 {
+			return // success or non-404 terminal exit
+		}
+
+		isLast := pi == len(profiles)-1
+		if isLast {
+			cp.Fail("failed")
+			deviceNotFound(serial)
 			os.Exit(1)
 		}
-		if isAuthError(err) {
-			fmt.Fprintf(os.Stderr, "Tunnel failed: %v\n", err)
-			os.Exit(1)
+
+		// Intermediate 404: render "failed (404)" in place, pause briefly, then replace lines in-place
+		cp.FailInPlace("failed (404)")
+		time.Sleep(400 * time.Millisecond)
+		t.close()
+
+		nextProf := profiles[pi+1]
+		if showHeader {
+			fmt.Printf("\033[A\r\033[2K[%d/%d] Trying %s profile\n\r\033[2K", pi+2, len(profiles), nextProf.displayName())
+		} else {
+			fmt.Print("\r\033[2K")
 		}
-		fmt.Fprintf(os.Stderr, "Tunnel failed, reason - %v, giving up after %d attempts\n", err, RETRY_ATTEMPTS)
-		os.Exit(1)
-	})
+	}
 }
 
 // verifyDevice performs a lightweight existence check (and, for Type 1, a
@@ -617,9 +650,27 @@ func distribute(specs []PortSpec, threads int) []specGroup {
 	return groups
 }
 
-func runMulti(serial string, prof *appProfile, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool) {
-	ok, salt := verifyDevice(serial, prof, dtype, username, password, randsalt, specs, debug)
-	if !ok {
+func runMulti(serial string, profiles []*appProfile, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool) {
+	showHeader := len(profiles) > 1
+
+	// Try each profile until verifyDevice succeeds.
+	var prof *appProfile
+	salt := randsalt
+	for pi, p := range profiles {
+		if showHeader {
+			if pi > 0 {
+				fmt.Print("\033[A\r\033[2K")
+			}
+			fmt.Printf("[%d/%d] Trying %s profile\n", pi+1, len(profiles), p.displayName())
+		}
+		ok, s := verifyDevice(serial, p, dtype, username, password, randsalt, specs, debug)
+		if ok {
+			prof = p
+			salt = s
+			break
+		}
+	}
+	if prof == nil {
 		deviceNotFound(serial)
 		os.Exit(1)
 	}

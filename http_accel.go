@@ -276,14 +276,14 @@ func (t *Tunnel) accelDoRangeRequest(path string, start, end int64) (*accelRange
 
 	// Register a buffered data channel for this realm.
 	dataCh := make(chan []byte, 2048)
-	t.scanMu.Lock()
-	t.scanResults[realmID] = dataCh
-	t.scanMu.Unlock()
+	t.accelMu.Lock()
+	t.accelResults[realmID] = dataCh
+	t.accelMu.Unlock()
 
 	defer func() {
-		t.scanMu.Lock()
-		delete(t.scanResults, realmID)
-		t.scanMu.Unlock()
+		t.accelMu.Lock()
+		delete(t.accelResults, realmID)
+		t.accelMu.Unlock()
 		// Send DISC to clean up on camera side.
 		if p := t.getPrimary(); p != nil && !t.useTCPPath {
 			disc := make([]byte, 16)
@@ -317,9 +317,9 @@ func (t *Tunnel) accelDoRangeRequest(path string, start, end int64) (*accelRange
 			}
 		case <-time.After(500 * time.Millisecond):
 			// Check if DISC arrived (realm deleted).
-			t.scanMu.Lock()
-			still := t.scanResults[realmID] != nil
-			t.scanMu.Unlock()
+			t.accelMu.Lock()
+			still := t.accelResults[realmID] != nil
+			t.accelMu.Unlock()
 			if !still {
 				goto parse
 			}

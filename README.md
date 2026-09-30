@@ -22,7 +22,6 @@ Software for creating tunnels to a Dahua camera (by serial number), forwarding a
 - Supports connecting to cameras **released after 2024**
 - Supports multithreading
 - Builds stable tunnels to the camera
-- Includes a port scanner
 - Auto-updater
 
 > [!CAUTION]
@@ -104,7 +103,7 @@ Local ports are bound to `127.0.0.1` (`localhost`).
 ./dh-fwd SN -p 1337:80
 ```
 ```text
-[23:54] dh-fwd v2.3.1 (latest)
+[23:54] dh-fwd v2.4 (latest)
 Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on :1337
 ```
 
@@ -116,7 +115,7 @@ Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on
 ```
 
 ```text
-[23:59] dh-fwd v2.3.1 (latest)
+[23:59] dh-fwd v2.4 (latest)
 Connecting to 4C04441PAG726F6:80,81 [=======================>] 100 % | Listening on :5080, 5081
 ```
 

@@ -80,7 +80,7 @@ var notFoundPrinted sync.Once
 
 func deviceNotFound(serial string) {
 	notFoundPrinted.Do(func() {
-		fmt.Printf("%s doesn't exist or turned off.\n", serial)
+		fmt.Printf("\033[31m[!]\033[0m %s \033[31mdoesn't exist or turned off.\033[0m\n", serial)
 	})
 }
 
@@ -227,9 +227,8 @@ type Tunnel struct {
 	errMu     sync.Mutex
 	failErr   error
 
-	scanMu      sync.Mutex
-	scanWait    map[uint32]chan scanOutcome
-	scanResults map[uint32]chan []byte
+	accelMu      sync.Mutex
+	accelResults map[uint32]chan []byte
 
 	// In-place data-path recovery (SmartPSS parity: the app never rebuilds
 	// the tunnel on the first stall — it re-hits the punch path and keeps
@@ -309,21 +308,21 @@ func newTunnel(serial string, prof *appProfile, dtype int, username, password, r
 		poolSize = 0
 	}
 	t := &Tunnel{
-		serial:      serial,
-		dtype:       dtype,
-		profile:     prof,
-		username:    username,
-		password:    password,
-		randsalt:    randsalt,
-		debug:       debug,
-		logRetries:  logRetries,
-		useTCP:      forceTCP,
-		poolTarget:  poolSize,
+		serial:       serial,
+		dtype:        dtype,
+		profile:      prof,
+		username:     username,
+		password:     password,
+		randsalt:     randsalt,
+		debug:        debug,
+		logRetries:   logRetries,
+		useTCP:       forceTCP,
+		poolTarget:   poolSize,
 		poolExplicit: poolExplicit,
-		specs:       g.specs,
-		specIdx:     g.idxs,
-		reg:         reg,
-		cseqCounter: CSEQ_BASE,
+		specs:        g.specs,
+		specIdx:      g.idxs,
+		reg:          reg,
+		cseqCounter:  CSEQ_BASE,
 	}
 	if reg != nil {
 		t.ui = reg.ui
@@ -350,10 +349,7 @@ func (t *Tunnel) reset() {
 	t.setPrimary(nil)
 	t.chanKey = nil
 	t.bindWait = make(map[uint32]chan struct{})
-	t.scanMu.Lock()
-	t.scanWait = make(map[uint32]chan scanOutcome)
-	t.scanResults = make(map[uint32]chan []byte)
-	t.scanMu.Unlock()
+	t.accelResults = make(map[uint32]chan []byte)
 	t.pools = make(map[int]*poolState)
 	if t.forceAppRelay && !t.poolExplicit {
 		t.poolTarget = 0
@@ -839,7 +835,7 @@ func (t *Tunnel) establish() error {
 			}
 		} else {
 			// “»±°»‹№ µ°„ + per-host backoff + ‚°† ° ·°°№
-			// µ‚‡µ (easy4ip »‚°µ‚  70% alloc-°‚°° 
+			// µ‚‡µ (easy4ip »‚°µ‚  70% alloc-°‚°°
 			// °·№, live 2026-09-13).
 			var ok bool
 			agentHost, agentPort, agentToken, ok = t.allocRelayAgent(mainRemote, fmt.Sprintf("%s:%d", relayHost, relayPort))
@@ -2102,7 +2098,7 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 		if err != nil {
 			return
 		}
-		if t.dispatchScanData(pl.Realm, pl.Payload) {
+		if t.dispatchAccelData(pl.Realm, pl.Payload) {
 			return
 		}
 		if c := t.getClient(pl.Realm); c != nil && len(pl.Payload) > 0 {
@@ -2111,7 +2107,7 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 	case 0x12:
 		realm := binary.BigEndian.Uint32(p.Body[4:8])
 		isDisc := len(p.Body) >= 16 && string(p.Body[12:16]) == "DISC"
-		if t.dispatchScan12(realm, isDisc) {
+		if isDisc && t.dispatchAccelDisc(realm) {
 			return
 		}
 		if ch := t.takeBindWait(realm); ch != nil {
@@ -2235,20 +2231,15 @@ func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error))
 			isAuthError(err) ||
 			strings.Contains(err.Error(), "no listeners available")
 		if terminal {
-			if errors.Is(err, errDeviceNotFound) {
-				deviceNotFound(t.serial)
-			}
 			if t.reg != nil {
 				for _, idx := range t.specIdx {
 					t.reg.fail(idx, err.Error())
 				}
 			}
 			if cp != nil {
-				reason := err.Error()
-				if errors.Is(err, errDeviceNotFound) {
-					reason = "device not found"
+				if !errors.Is(err, errDeviceNotFound) {
+					cp.Fail(err.Error())
 				}
-				cp.Fail(reason)
 			}
 			if onExhausted != nil {
 				onExhausted(err)
@@ -2430,7 +2421,7 @@ func queryDeviceInfo(serial string, prof *appProfile, debug bool) int {
 	u.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
 	res, _ := u.Request(fmt.Sprintf("/online/p2psrv/%s", serial), "", true, true)
 	if res == nil || res.Code >= 400 || res.Body["body/US"] == "" {
-		fmt.Printf("%s doesn't exist or turned off.\n", serial)
+		deviceNotFound(serial)
 		return 1
 	}
 	us := strings.SplitN(res.Body["body/US"], ":", 2)
@@ -2514,17 +2505,10 @@ func isMostlyPrintable(b []byte) bool {
 	return ok*100/len(b) > 90
 }
 
-type scanOutcome int
-
-const (
-	scanOutcomeConn scanOutcome = iota
-	scanOutcomeDisc
-)
-
-func (t *Tunnel) dispatchScanData(realm uint32, payload []byte) bool {
-	t.scanMu.Lock()
-	ch := t.scanResults[realm]
-	t.scanMu.Unlock()
+func (t *Tunnel) dispatchAccelData(realm uint32, payload []byte) bool {
+	t.accelMu.Lock()
+	ch := t.accelResults[realm]
+	t.accelMu.Unlock()
 	if ch != nil {
 		cp := make([]byte, len(payload))
 		copy(cp, payload)
@@ -2537,28 +2521,17 @@ func (t *Tunnel) dispatchScanData(realm uint32, payload []byte) bool {
 	return false
 }
 
-func (t *Tunnel) dispatchScan12(realm uint32, isDisc bool) bool {
-	t.scanMu.Lock()
-	ch := t.scanWait[realm]
-	dataCh := t.scanResults[realm]
-	if isDisc && dataCh != nil {
-		select {
-		case dataCh <- nil:
-		default:
-		}
-	}
-	t.scanMu.Unlock()
+func (t *Tunnel) dispatchAccelDisc(realm uint32) bool {
+	t.accelMu.Lock()
+	ch := t.accelResults[realm]
+	delete(t.accelResults, realm)
+	t.accelMu.Unlock()
 	if ch != nil {
-		outcome := scanOutcomeConn
-		if isDisc {
-			outcome = scanOutcomeDisc
-		}
 		select {
-		case ch <- outcome:
+		case ch <- nil:
 		default:
 		}
 		return true
 	}
 	return false
 }
-

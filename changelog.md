@@ -1,3 +1,10 @@
+[1.10.26] dh-fwd v2.4
+```md
+ - [+] Фоллбэк на любой из профилей если текущий вернул 404 | Auto-fallback between profiles on 404
+ - [~] fixed: чуть чуть багов UI | fixed: minor UI bugs
+ - [-] Удалён портсканер (--scan) за ненадобностью | Removed port scanner (--scan) as redundant
+```
+
 [16.09.26] dh-fwd v2.3.1
 ```md
  - [+] Предупреждение о нестабильности релейного канала | Warning for relay path instability

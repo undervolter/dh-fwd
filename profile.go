@@ -136,6 +136,24 @@ func profileByName(name string) (*appProfile, error) {
 	return nil, fmt.Errorf("unknown app profile %q (want smartpss or dmss)", name)
 }
 
+// displayName returns a human-readable label for UI output.
+func (p *appProfile) displayName() string {
+	switch p.name {
+	case "smartpss":
+		return "SmartPSS"
+	case "dmss":
+		return "DMSS"
+	}
+	return p.name
+}
+
+// profileFallbackOrder returns the automatic profile discovery sequence:
+// smartpss first (easy4ip cloud), then dmss (Dolynk cloud). Used when the
+// operator does not pin a specific --app profile.
+func profileFallbackOrder() []*appProfile {
+	return []*appProfile{smartpssProfile, dmssProfile}
+}
+
 // randomHex returns n crypto-random bytes as 2n lowercase hex chars — the
 // format of the DMSS app's x-pcs-request-id and ClientId session id.
 func randomHex(n int) string {
