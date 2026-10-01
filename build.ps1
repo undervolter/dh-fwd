@@ -1,5 +1,5 @@
 param(
-    [string]$Version  = "v2.3.1",
+    [string]$Version,
     [string]$OutDir   = "builds"
 )
 
@@ -16,6 +16,16 @@ $Targets = @(
 # Prep
 $Root = $PSScriptRoot
 if (-not $Root) { $Root = (Get-Location).Path }
+
+if (-not $Version) {
+    if (Test-Path "$Root\updater.go") {
+        $m = Select-String -Path "$Root\updater.go" -Pattern 'var Version\s*=\s*"([^"]+)"'
+        if ($m.Matches.Groups.Count -gt 1) {
+            $Version = $m.Matches.Groups[1].Value
+        }
+    }
+    if (-not $Version) { $Version = "v2.4" }
+}
 
 New-Item -ItemType Directory -Force -Path "$Root\$OutDir" | Out-Null
 
