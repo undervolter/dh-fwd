@@ -1,5 +1,5 @@
 //go:build !windows
 
-package main
+package core
 
 func initTerminal() {}

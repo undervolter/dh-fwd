@@ -1,4 +1,4 @@
-package main
+package core
 
 // relay_resilience.go —  relay-  
 //  easy4ip (live 2026-09-13: 177 alloc' → 52 , 52

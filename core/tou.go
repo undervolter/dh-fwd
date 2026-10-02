@@ -1,4 +1,4 @@
-package main
+package core
 
 // TOU framing over the TCP relay channel, byte-exact from P2PDll.dll
 // (CTcpRelayChannel::parseTouPacket 0x180018660, sendSyn 0x1800158B0,

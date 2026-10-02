@@ -1,4 +1,4 @@
-package main
+package core
 
 // Regression tests for the app-parity relay data path (capture 2026-09-06,
 // spike/capture/dmss-capture2.pcap):

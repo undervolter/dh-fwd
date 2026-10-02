@@ -1,4 +1,4 @@
-package main
+package core
 
 // TCP-relay data path ("TOU over TCP"): HTTP bind to the relay agent,
 // then session-framed TOU packets over the same TCP connection.

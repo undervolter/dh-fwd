@@ -29,7 +29,7 @@ if (-not $Version) {
 
 New-Item -ItemType Directory -Force -Path "$Root\$OutDir" | Out-Null
 
-$LdFlags = "-s -w -X main.Version=$Version"
+$LdFlags = "-s -w -X main.Version=$Version -X dh-fwd/core.Version=$Version"
 $ok  = 0
 $err = 0
 
