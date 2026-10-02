@@ -2,6 +2,7 @@
 ```md
  - [+] Added flag -ar to force switch the app dialect
  - [~] fixed: PTCP syncer
+ - [~] reworked: Relay instability warning
 ```
 
 [1.10.26] dh-fwd v2.4
