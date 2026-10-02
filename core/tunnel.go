@@ -1501,6 +1501,13 @@ func ptcpHandshake(u *UDP, signToken []byte) error {
 }
 
 // serve opens the local listeners and pumps traffic until the tunnel dies.
+// IsDirect reports whether the active data path is direct UDP (STUN punch), rather than relay.
+func (t *Tunnel) IsDirect() bool {
+	t.socksMu.Lock()
+	defer t.socksMu.Unlock()
+	return !t.useTCPPath && t.primary != nil && t.primary == t.deviceRemote
+}
+
 func (t *Tunnel) serve() error {
 	type okListen struct {
 		idx    int
@@ -1540,9 +1547,19 @@ func (t *Tunnel) serve() error {
 		// Single-mode: overwrite the progress bar line with the final "Listening" message.
 		o := oks[0]
 		t.progress.Done(fmt.Sprintf("Listening on :%d -> :%d", o.port, o.remote))
+		if t.IsDirect() {
+			fmt.Println("\033[32m[+]\033[0m Connected via direct path!")
+		} else {
+			fmt.Println("\033[33m[!]\033[0m STUN punch failed! Using relay path (can be unstable)")
+		}
 	} else if t.ui == nil && t.progress == nil {
 		for _, o := range oks {
 			fmt.Printf("Listening on port %d, remote port %d\n", o.port, o.remote)
+		}
+		if t.IsDirect() {
+			fmt.Println("\033[32m[+]\033[0m Connected via direct path!")
+		} else {
+			fmt.Println("\033[33m[!]\033[0m STUN punch failed! Using relay path (can be unstable)")
 		}
 	}
 

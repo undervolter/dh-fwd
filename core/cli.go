@@ -325,18 +325,7 @@ func Execute() {
 		return
 	}
 
-	if !autoYes {
-		fmt.Print("\033[31m[!]\033[0m Using relay path (unstable). Proceed? (y/n) ")
-		reader := bufio.NewReader(os.Stdin)
-		ans, err := reader.ReadString('\n')
-		if err != nil {
-			os.Exit(0)
-		}
-		ans = strings.ToLower(strings.TrimSpace(ans))
-		if ans != "y" && ans != "yes" && ans != "д" && ans != "да" && ans != "l" {
-			os.Exit(0)
-		}
-	}
+
 
 	if tcpRelayMode {
 		fmt.Println("\033[31m[!]\033[0m Dahua may not accept TCP connections!")
@@ -790,6 +779,18 @@ func runMulti(serial string, profiles []*appProfile, specs []PortSpec, threads i
 				os.Exit(1)
 			}
 			cp.Done(fmt.Sprintf("Listening on %s", strings.Join(localStrs, ", ")))
+			anyRelay := false
+			live.Range(func(key, value any) bool {
+				if tun, ok := value.(*Tunnel); ok && !tun.IsDirect() {
+					anyRelay = true
+				}
+				return true
+			})
+			if anyRelay {
+				fmt.Println("\033[33m[!]\033[0m STUN punch failed! Using relay path (can be unstable)")
+			} else {
+				fmt.Println("\033[32m[+]\033[0m Connected via direct path!")
+			}
 			summarized = true
 		}
 	}
