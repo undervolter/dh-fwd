@@ -53,16 +53,23 @@ go build .
 
 | Flag | Short | Description |
 | --- | --- | --- |
-| `--scan` | `-` | Scan ports on the camera (without opening local tunnels) |
+| `--port` | `-p` | Port mapping (e.g. `5080:80`, `554`, see below) |
 | `--creds` | `-c` | Credentials `username:password` (Type 1 Auth, auto-salt) |
-| `--debug` | `-d` | Debug mode |
-| `--log-retries` | `-lr` | Log retry attempts with a timestamp |
-| `--port` | `-p` | Port (see below) |
-| `--threads` | `-mt` | Number of threads (default 3) |
-| `--pool` | `-` | Number of realms in the pool (default 50) |
-| `--smart-pss` | `-2` | Forwards ports 80 and 37777 simultaneously |
-| `--app dmss/smartpss` | `-` | Profile selection (smartpss or dmss) |
-| `--tcp-relay` | `-R` | Force switch to TCP relay |
+| `--type` | `-t` | Device auth type: `0` = no auth (default), `1` = with auth |
+| `--username` | `-u` | Username (required when `--type 1` without `--creds`) |
+| `--password` | `-P` | Password (required when `--type 1` without `--creds`) |
+| `--randsalt` | `-s` | RandSalt from device info blob (auto-resolved if omitted) |
+| `--app <smartpss\|dmss>` | `-` | Profile selection: `smartpss` (easy4ip) or `dmss` (dolynk) |
+| `--app-relay` | `-ar` | Force app relay dialect (skips 0x17/0x19 token auth for 2024+ devices and relays) |
+| `--tcp-relay` | `-R` | Force switch to TCP relay (TOU over TCP) |
+| `--smartpss`, `--smart-pss` | `-2` | SmartPSS preset: forward 80 and 37777 on free local ports |
+| `--threads` | `-mt` | Number of parallel tunnels (default 3) |
+| `--pool`, `--pools` | `-` | Number of realms in the pool (default 50; 0 disables) |
+| `--info` | `-` | Query `/info/device/<SN>` and decrypt the Info blob (randsalt, devP2PVersion) |
+| `--heartbeat-timeout` | `-hb` | PTCP heartbeat timeout (default 10s) |
+| `--debug` | `-d` | Debug protocol output |
+| `--log-retries` | `-lr` | Log retry attempts with timestamps |
+| `--yes` | `-y` | Skip confirmation prompts |
 
 `--help` / `-h` prints a list of all available commands.
 
@@ -103,7 +110,7 @@ Local ports are bound to `127.0.0.1` (`localhost`).
 ./dh-fwd SN -p 1337:80
 ```
 ```text
-[23:54] dh-fwd v2.4 (latest)
+[23:54] dh-fwd v2.4.1 (latest)
 Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on :1337
 ```
 
@@ -115,7 +122,7 @@ Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on
 ```
 
 ```text
-[23:59] dh-fwd v2.4 (latest)
+[23:59] dh-fwd v2.4.1 (latest)
 Connecting to 4C04441PAG726F6:80,81 [=======================>] 100 % | Listening on :5080, 5081
 ```
 
