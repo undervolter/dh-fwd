@@ -229,6 +229,8 @@ func main() {
 	flag.BoolVar(&logRetries, "lr", false, "log retry details")
 	flag.DurationVar(&hbTimeout, "heartbeat-timeout", 10*time.Second, "PTCP heartbeat timeout")
 	flag.DurationVar(&hbTimeout, "hb", 10*time.Second, "PTCP heartbeat timeout")
+	flag.BoolVar(&ForceAppRelay, "app-relay", false, "force app relay dialect (skips 0x17/0x19 token auth, for 2024+ devices and modern relays)")
+	flag.BoolVar(&ForceAppRelay, "ar", false, "force app relay dialect")
 	flag.StringVar(&appName, "app", "smartpss", "application profile: smartpss (default) or dmss — picks the cloud host, app credentials and request dialect (dmss for devices bound via the DMSS app)")
 	var autoYes bool
 	flag.BoolVar(&autoYes, "y", false, "skip confirmation prompts")
@@ -359,6 +361,8 @@ General:
   --heartbeat-timeout, -hb <dur>  PTCP heartbeat timeout (default 10s)
   --info                          decrypt /info/device/<SN> Info blob
                                   (prints randsalt / devP2PVersion)
+  --app-relay, -ar                force app relay dialect (skips 0x17/0x19
+                                  token auth on modern devices / relays)
   --tcp-relay, -R                 force the TCP-relay data path (TOU over TCP)
   --smartpss, --smart-pss, -2     SmartPSS preset: forward 80+37777 on free
                                   local ports (DVRIP + web/API channels)

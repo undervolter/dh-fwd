@@ -1,3 +1,9 @@
+[03.10.26] dh-fwd v2.4.1
+```md
+ - [+] Added flag -ar to force switch the app dialect
+ - [~] fixed: PTCP syncer
+```
+
 [1.10.26] dh-fwd v2.4
 ```md
  - [+] Фоллбэк на любой из профилей если текущий вернул 404 | Auto-fallback between profiles on 404

@@ -88,6 +88,9 @@ func isNotFound(reason string) bool {
 	return reason == errDeviceNotFound.Error()
 }
 
+var ForceAppRelay = false
+var errPTCPAppFallback = errors.New("ptcp token spam: app dialect fallback")
+
 var ptcpHeartbeat = []byte{
 	0x13, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x00, 0x00,
@@ -673,15 +676,32 @@ func (t *Tunnel) handshake() error {
 // is strictly safer; if the token never arrives, the read timeout
 // surfaces as a regular error instead of a process-killing panic.
 func (t *Tunnel) waitForPTCPToken(u *UDP, timeout time.Duration) (*PTCP, error) {
+	deadline := time.Now().Add(timeout)
+	shorts := 0
 	for {
-		p, err := u.ReadPTCP(timeout)
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return nil, fmt.Errorf("ptcp token timeout (%d short/heartbeat frames)", shorts)
+		}
+		if remain > 5*time.Second {
+			remain = 5 * time.Second
+		}
+		p, err := u.ReadPTCP(remain)
 		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
 			return nil, err
 		}
-		if len(p.Body) >= 13 {
-			return p, nil
+		if len(p.Body) <= 12 || p.Body[0] == 0x13 {
+			shorts++
+			if shorts >= 5 {
+				return nil, errPTCPAppFallback
+			}
+			t.logf("ptcp 0x17: discarding short body (%d bytes: %x) — waiting for token", len(p.Body), p.Body)
+			continue
 		}
-		t.logf("ptcp 0x17: discarding short body (%d bytes: %x) — waiting for token", len(p.Body), p.Body)
+		return p, nil
 	}
 }
 
@@ -987,7 +1007,7 @@ func (t *Tunnel) establish() error {
 		// Complete the 3-way PTCP handshake by acknowledging the relay's SYNC frame.
 		mainRemote.RequestPTCP(nil)
 
-		if !t.profile.noRelayAuth && !t.forceAppRelay {
+		if !t.profile.noRelayAuth && !t.forceAppRelay && !ForceAppRelay {
 			t.statusf(PhaseNATPunch, "PTCP token")
 			mainRemote.RequestPTCP([]byte{
 				0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -996,10 +1016,16 @@ func (t *Tunnel) establish() error {
 			t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
 			p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
 			if err != nil {
-				return fmt.Errorf("ptcp 0x17: %v", err)
+				if errors.Is(err, errPTCPAppFallback) {
+					t.forceAppRelay = true
+					t.logf("ptcp 0x17: token not supported by relay (heartbeat spam), switching to app relay dialect")
+				} else {
+					return fmt.Errorf("ptcp 0x17: %v", err)
+				}
+			} else {
+				sign = p.Body[12:]
+				mainRemote.RequestPTCP(nil)
 			}
-			sign = p.Body[12:]
-			mainRemote.RequestPTCP(nil)
 		}
 	}
 
@@ -1132,7 +1158,7 @@ func (t *Tunnel) establish() error {
 	// forceAppRelay retry (zombie watchdog) takes the app-parity branch too:
 	// the previous attempt's 0x17/0x19 exchange is the likely reason the
 	// device stopped routing DATA.
-	if t.profile.noRelayAuth || t.forceAppRelay {
+	if t.profile.noRelayAuth || t.forceAppRelay || ForceAppRelay {
 		// App relay dialect (capture 2026-09-06, spike/capture/dmss-capture2.pcap):
 		// after the STUN exchange the client sends exactly ONE PTCP SYNC and
 		// then BIND/DATA — never the 0x17 token request or 0x19 auth. The

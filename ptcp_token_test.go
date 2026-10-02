@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -83,5 +84,31 @@ func TestWaitForPTCPTokenTimesOutOnShortBodiesOnly(t *testing.T) {
 	tr := &Tunnel{}
 	if _, err := tr.waitForPTCPToken(u, 300*time.Millisecond); err == nil {
 		t.Fatalf("waitForPTCPToken: want timeout error, got a body")
+	}
+}
+
+func TestWaitForPTCPTokenFallsBackOnHeartbeatSpam(t *testing.T) {
+	u := NewUDP("", 0, false, nil)
+	if u.initErr != nil {
+		t.Fatalf("udp init: %v", u.initErr)
+	}
+	defer u.Close()
+
+	peer, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Skipf("udp listen: %v", err)
+	}
+	defer peer.Close()
+
+	// Send 5 heartbeat frames (0x13) to trigger app dialect fallback
+	hb := []byte{0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	for i := 0; i < 5; i++ {
+		sendPTCPFrame(t, peer, u, hb)
+	}
+
+	tr := &Tunnel{}
+	_, err = tr.waitForPTCPToken(u, 2*time.Second)
+	if err == nil || !errors.Is(err, errPTCPAppFallback) {
+		t.Fatalf("waitForPTCPToken: want errPTCPAppFallback, got %v", err)
 	}
 }

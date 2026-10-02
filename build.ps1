@@ -24,7 +24,7 @@ if (-not $Version) {
             $Version = $m.Matches.Groups[1].Value
         }
     }
-    if (-not $Version) { $Version = "v2.4" }
+    if (-not $Version) { $Version = "v2.4.1" }
 }
 
 New-Item -ItemType Directory -Force -Path "$Root\$OutDir" | Out-Null
