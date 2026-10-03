@@ -191,7 +191,7 @@ func parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 
 func Execute() {
 	var debug, logRetries, infoMode, tcpRelayMode bool
-	var smartpssPreset bool
+	var smartpssPreset, portTestMode bool
 	var poolSize int
 	var dtype int
 	var username, password, randsalt string
@@ -203,6 +203,7 @@ func Execute() {
 	flag.BoolVar(&debug, "debug", false, "debug protocol output")
 	flag.BoolVar(&debug, "d", false, "debug protocol output")
 	flag.BoolVar(&infoMode, "info", false, "query /info/device/<SN> and decrypt the Info blob (randsalt, devP2PVersion)")
+	flag.BoolVar(&portTestMode, "test", false, "port test: query the Info blob and print the resolved camera ports + forward plan (no tunnel)")
 	flag.BoolVar(&tcpRelayMode, "R", false, "force the TCP-relay data path (TOU over TCP)")
 	flag.BoolVar(&tcpRelayMode, "tcp-relay", false, "force the TCP-relay data path (TOU over TCP)")
 	flag.BoolVar(&smartpssPreset, "2", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
@@ -310,6 +311,13 @@ func Execute() {
 		threads = 1
 	}
 
+	// --test: resolve the camera's real ports through the SAME code path a
+	// tunnel uses (probe + applyDevicePorts), print the resolved ports and
+	// the forward plan, exit. No listeners, no PTCP session.
+	if portTestMode {
+		os.Exit(runPortTest(serial, profiles[0], specs, debug))
+	}
+
 	multi := len(specs) > 1
 	poolExplicit := false
 	flag.Visit(func(f *flag.Flag) {
@@ -350,6 +358,10 @@ General:
   --heartbeat-timeout, -hb <dur>  PTCP heartbeat timeout (default 10s)
   --info                          decrypt /info/device/<SN> Info blob
                                   (prints randsalt / devP2PVersion)
+  --test                          port test: resolve the camera's real ports
+                                  from the Info blob (httpport/privport/
+                                  rtspport) and print the forward plan,
+                                  no tunnel
   --app-relay, -ar                force app relay dialect (skips 0x17/0x19
                                   token auth on modern devices / relays)
   --tcp-relay, -R                 force the TCP-relay data path (TOU over TCP)
@@ -397,6 +409,97 @@ func parsePortSpec(portSpec string) ([]PortSpec, error) {
 		return makePortSpecs(locals, remotes)
 	}
 	return []PortSpec{{Local: 554, Remote: 554}}, nil
+}
+
+// runPortTest resolves the camera's real ports through the SAME code path a
+// tunnel uses — device probe + applyDevicePorts on a bare Tunnel — prints
+// the resolved ports and the resulting forward plan, and exits without
+// opening listeners or a PTCP session. Exit code: 0 = answered (blob or
+// not), 1 = the device/cloud gave nothing to parse.
+func runPortTest(serial string, prof *appProfile, specs []PortSpec, debug bool) int {
+	fmt.Printf("port test: %s (%s profile)\n", serial, prof.displayName())
+
+	u := NewUDP(prof.mainServer, prof.mainPort, debug, prof)
+	defer u.Close()
+	if u.initErr != nil {
+		fmt.Fprintf(os.Stderr, "main socket: %v\n", u.initErr)
+		return 1
+	}
+	u.RequestEx(prof.warmupPath, "", prof.warmupAuth, true, reqOpts{warmup: true})
+	res, _ := u.Request(fmt.Sprintf("/online/p2psrv/%s", serial), "", true, true)
+	if res == nil || res.Code >= 400 || res.Body["body/US"] == "" {
+		fmt.Fprintf(os.Stderr, "device %s not found on p2psrv\n", serial)
+		return 1
+	}
+	us := strings.SplitN(res.Body["body/US"], ":", 2)
+	if len(us) < 2 {
+		fmt.Fprintf(os.Stderr, "malformed US address %q\n", res.Body["body/US"])
+		return 1
+	}
+	usPort, _ := strconv.Atoi(us[1])
+
+	v := NewUDP(us[0], usPort, debug, prof)
+	defer v.Close()
+	if v.initErr != nil {
+		fmt.Fprintf(os.Stderr, "device socket: %v\n", v.initErr)
+		return 1
+	}
+	payload := probeDeviceInfo(v, serial)
+	if payload == nil {
+		fmt.Fprintf(os.Stderr, "no answer to /info/device — ports unknown, defaults stay (80/37777/554)\n")
+		return 1
+	}
+
+	tr := &Tunnel{}
+	tr.applyDevicePorts(payload)
+	httpP, privP, rtspP := tr.DevicePorts()
+	if httpP == 0 && privP == 0 && rtspP == 0 {
+		fmt.Println("no Info blob (or no port fields in it) — defaults stay: http=80 priv=37777 rtsp=554")
+		return 0
+	}
+
+	label := func(real int, def int) string {
+		if real == 0 {
+			return fmt.Sprintf("%-5d (default — no blob field)", def)
+		}
+		if real != def {
+			return fmt.Sprintf("%-5d (override — blob says %d)", real, real)
+		}
+		return fmt.Sprintf("%-5d (default)", def)
+	}
+	fmt.Println("camera ports:")
+	fmt.Printf("  httpport : %s\n", label(httpP, 80))
+	fmt.Printf("  privport : %s\n", label(privP, 37777))
+	fmt.Printf("  rtspport : %s\n", label(rtspP, 554))
+
+	fmt.Println("forward plan (local -> camera):")
+	for i, s := range specs {
+		remote := s.Remote
+		switch remote {
+		case 80:
+			if httpP != 0 {
+				remote = httpP
+			}
+		case 37777:
+			if privP != 0 {
+				remote = privP
+			}
+		case 554:
+			if rtspP != 0 {
+				remote = rtspP
+			}
+		}
+		mark := ""
+		if remote != s.Remote {
+			mark = fmt.Sprintf("  (rewritten: %d -> %d)", s.Remote, remote)
+		}
+		if s.Local == 0 {
+			fmt.Printf("  [%d] (ephemeral) -> %d%s\n", i, remote, mark)
+			continue
+		}
+		fmt.Printf("  [%d] %d -> %d%s\n", i, s.Local, remote, mark)
+	}
+	return 0
 }
 
 func parsePortLists(spec string) (locals, remotes []int, err error) {
