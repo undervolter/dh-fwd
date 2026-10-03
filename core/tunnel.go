@@ -210,6 +210,16 @@ type Tunnel struct {
 	ui       *UI
 	progress *ConnectProgress // non-nil only in single-port mode
 
+	// Real camera ports from the /info/device Info blob (httpport,
+	// privport, rtspport). 0 = "no data — keep the default". Filled in
+	// establish() (the probe answer is already in flight — no extra
+	// request), applied in serve() to the spec remote sides before the
+	// listeners bind. Cameras with shifted ports used to open forwards
+	// into a black hole: tunnel alive, every client connection silent.
+	camHTTP int
+	camPriv int
+	camRTSP int
+
 	deviceRemote *UDP
 	mainRemote   *UDP
 	primary      *UDP // data path: deviceRemote (direct) or mainRemote (relay)
@@ -749,8 +759,9 @@ func (t *Tunnel) establish() error {
 	t.statusf(PhaseDeviceProbe, "device probe")
 	p2psrvRemote := NewUDP(p2psrv[0], p2psrvPort, t.debug, t.profile)
 	p2psrvRemote.debugLog = t.logf
-	salt, err := resolveAutoSalt(t.profile, t.dtype, t.randsalt,
-		probeDeviceInfo(p2psrvRemote, t.serial), t.logf)
+	infoPayload := probeDeviceInfo(p2psrvRemote, t.serial)
+	t.applyDevicePorts(infoPayload)
+	salt, err := resolveAutoSalt(t.profile, t.dtype, t.randsalt, infoPayload, t.logf)
 	p2psrvRemote.Close()
 	if err != nil {
 		// AutoSalt required (dmss, type 1, no --randsalt) and the blob was
@@ -1509,6 +1520,24 @@ func (t *Tunnel) IsDirect() bool {
 }
 
 func (t *Tunnel) serve() error {
+	// Ports from the Info blob outrank the defaults: rewrite the spec
+	// remote sides before the listeners bind. A camera reporting
+	// httpport=81 / privport=37778 gets live forwards instead of silent
+	// dead dials into port 80 / 37777.
+	override := func(from, to int) {
+		if to <= 0 || to == from {
+			return
+		}
+		for i := range t.specs {
+			if t.specs[i].Remote == from {
+				t.specs[i].Remote = to
+			}
+		}
+	}
+	override(80, t.camHTTP)
+	override(37777, t.camPriv)
+	override(554, t.camRTSP)
+
 	type okListen struct {
 		idx    int
 		port   int
@@ -2379,6 +2408,55 @@ func probeDeviceInfo(u *UDP, serial string) []byte {
 		return nil
 	}
 	return data
+}
+
+// applyDevicePorts recovers the camera's REAL ports from the /info/device
+// Info blob (httpport/privport/rtspport — the same encrypted blob that
+// carries randsalt, printed by the `info` command as "Info (plain)") and
+// remembers them on the tunnel. A camera without a blob yields no answer:
+// the fields stay zero and serve() keeps the defaults. Validation
+// 1-65535: broken/zero blob fields never override the defaults. Blob
+// fields win over top-level response fields; both are consulted because
+// some firmwares also expose the ports at the top level.
+func (t *Tunnel) applyDevicePorts(payload []byte) {
+	if payload == nil {
+		return
+	}
+	fields, err := infoFields(strings.TrimSpace(string(payload)))
+	if err != nil {
+		return
+	}
+	if info := fields["Info"]; info != "" {
+		if plain, err := decryptDevInfoInfo(info); err == nil {
+			if inner, err := decodeInfoJSON(plain); err == nil {
+				for k, v := range inner {
+					fields[k] = v
+				}
+			}
+		}
+	}
+	read := func(key string) int {
+		if v, err := strconv.Atoi(fields[key]); err == nil && v >= 1 && v <= 65535 {
+			return v
+		}
+		return 0
+	}
+	httpP, privP, rtspP := read("httpport"), read("privport"), read("rtspport")
+	if httpP == 0 && privP == 0 && rtspP == 0 {
+		return // no valid port at all — stay quiet
+	}
+	t.socksMu.Lock()
+	t.camHTTP, t.camPriv, t.camRTSP = httpP, privP, rtspP
+	t.socksMu.Unlock()
+	t.logf("cam ports from info blob: http=%d priv=%d rtsp=%d", httpP, privP, rtspP)
+}
+
+// DevicePorts returns the camera's real ports from the Info blob
+// (0 = no data, keep the default 80/37777/554).
+func (t *Tunnel) DevicePorts() (http, priv, rtsp int) {
+	t.socksMu.Lock()
+	defer t.socksMu.Unlock()
+	return t.camHTTP, t.camPriv, t.camRTSP
 }
 
 // resolveAutoSalt recovers the Type-1 RandSalt from a raw /info/device

@@ -4,6 +4,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -176,3 +177,65 @@ func TestPoolFIFO(t *testing.T) {
 	}
 }
 
+
+// --- camera ports from the Info blob ---
+
+// applyDevicePorts recovers the real camera ports from the /info/device
+// Info blob. Invalid/zero fields (0, 70000) never override the defaults
+// (stay 0 = "no data"); valid values are read both from the top-level
+// answer and from the encrypted blob.
+func TestApplyDevicePorts(t *testing.T) {
+	tr := &Tunnel{}
+
+	// Silence / nil — zeros, defaults untouched.
+	tr.applyDevicePorts(nil)
+	if h, p, r := tr.DevicePorts(); h != 0 || p != 0 || r != 0 {
+		t.Fatalf("nil payload: got http=%d priv=%d rtsp=%d, want zeros", h, p, r)
+	}
+
+	// Top level: invalid fields filtered, the valid one taken.
+	tr.applyDevicePorts([]byte(`{"httpport":0,"privport":70000,"rtspport":554}`))
+	if h, p, r := tr.DevicePorts(); h != 0 || p != 0 || r != 554 {
+		t.Fatalf("top-level filter: got http=%d priv=%d rtsp=%d, want 0/0/554", h, p, r)
+	}
+
+	// Encrypted blob — the authoritative source (live log shape:
+	// httpport=80, privport=37777, randsalt, rtspport=554, tlsprivport).
+	payload := fmt.Sprintf(`{"Info":%q}`, encryptDevInfoInfo([]byte(`{"httpport":81,"privport":37778,"rtspport":554,"randsalt":"1eb7a35f"}`)))
+	tr.applyDevicePorts([]byte(payload))
+	if h, p, r := tr.DevicePorts(); h != 81 || p != 37778 || r != 554 {
+		t.Fatalf("blob: got http=%d priv=%d rtsp=%d, want 81/37778/554", h, p, r)
+	}
+}
+
+// serve() rewrites spec remote sides from the blob ports BEFORE the
+// listeners bind: a camera with httpport=81 gets a live forward instead
+// of a dead dial into port 80. Explicitly non-default operator ports are
+// never touched.
+func TestSpecPortOverride(t *testing.T) {
+	tr := &Tunnel{
+		specs: []PortSpec{{Local: 0, Remote: 80}, {Local: 0, Remote: 37777}, {Local: 0, Remote: 554}, {Local: 5080, Remote: 9000}},
+	}
+	tr.camHTTP, tr.camPriv, tr.camRTSP = 81, 37778, 554
+
+	override := func(from, to int) {
+		if to <= 0 || to == from {
+			return
+		}
+		for i := range tr.specs {
+			if tr.specs[i].Remote == from {
+				tr.specs[i].Remote = to
+			}
+		}
+	}
+	override(80, tr.camHTTP)
+	override(37777, tr.camPriv)
+	override(554, tr.camRTSP)
+
+	want := []PortSpec{{0, 81}, {0, 37778}, {0, 554}, {5080, 9000}}
+	for i, w := range want {
+		if tr.specs[i] != w {
+			t.Fatalf("spec[%d] = %+v, want %+v", i, tr.specs[i], w)
+		}
+	}
+}
