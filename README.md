@@ -31,6 +31,7 @@ Software for creating tunnels to a Dahua camera (by serial number), forwarding a
 > Also, Dahua may reject requests if you have a time desync.
 
 > [!IMPORTANT]
+> The tunnel won't build if you're using VPN or proxy!
 > If the connection to the camera goes through an intermediate server, the web panel might not work! Unfortunately, this is specifically a problem on Dahua's server side, so there's nothing to be done about it.
 
 ## Build
@@ -56,20 +57,18 @@ go build .
 | `--port` | `-p` | Port mapping (e.g. `5080:80`, `554`, see below) |
 | `--creds` | `-c` | Credentials `username:password` (Type 1 Auth, auto-salt) |
 | `--type` | `-t` | Device auth type: `0` = no auth (default), `1` = with auth |
-| `--username` | `-u` | Username (required when `--type 1` without `--creds`) |
-| `--password` | `-P` | Password (required when `--type 1` without `--creds`) |
-| `--randsalt` | `-s` | RandSalt from device info blob (auto-resolved if omitted) |
-| `--app <smartpss\|dmss>` | `-` | Profile selection: `smartpss` (easy4ip) or `dmss` (dolynk) |
-| `--app-relay` | `-ar` | Force app relay dialect (skips 0x17/0x19 token auth for 2024+ devices and relays) |
-| `--tcp-relay` | `-R` | Force switch to TCP relay (TOU over TCP) |
-| `--smartpss`, `--smart-pss` | `-2` | SmartPSS preset: forward 80 and 37777 on free local ports |
+| `--username` | `-u` | Username |
+| `--password` | `-P` | Password |
+| `--app <smartpss\|dmss>` | `-` | Profile selection |
+| `--app-relay` | `-ar` | Force app relay dialect |
+| `--tcp-relay` | `-R` | Force switch to TCP relay |
+| `--smartpss`, `--smart-pss` | `-2` | Forwards 80 and 37777 on free local ports |
 | `--threads` | `-mt` | Number of parallel tunnels (default 3) |
 | `--pool`, `--pools` | `-` | Number of realms in the pool (default 50; 0 disables) |
 | `--info` | `-` | Query `/info/device/<SN>` and decrypt the Info blob (randsalt, devP2PVersion) |
 | `--heartbeat-timeout` | `-hb` | PTCP heartbeat timeout (default 10s) |
-| `--debug` | `-d` | Debug protocol output |
+| `--debug` | `-d` | Debug (logs are in dh-fwd.log) |
 | `--log-retries` | `-lr` | Log retry attempts with timestamps |
-| `--yes` | `-y` | Skip confirmation prompts |
 
 `--help` / `-h` prints a list of all available commands.
 
