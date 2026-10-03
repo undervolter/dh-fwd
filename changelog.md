@@ -1,4 +1,4 @@
-[03.10.26] dh-fwd v2.4.1
+[3.10.26] dh-fwd v2.4.1
 ```md
  - [+] Added flag -ar to force switch the app dialect
  - [~] fixed: PTCP syncer
