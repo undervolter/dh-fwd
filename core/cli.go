@@ -454,8 +454,24 @@ func runPortTest(serial string, prof *appProfile, specs []PortSpec, debug bool) 
 	tr.applyDevicePorts(payload)
 	httpP, privP, rtspP := tr.DevicePorts()
 	if httpP == 0 && privP == 0 && rtspP == 0 {
+		// Context: what the device actually answered with, so "no blob"
+		// is distinguishable from "answer is garbage".
+		if fields, ferr := infoFields(strings.TrimSpace(string(payload))); ferr == nil {
+			if dv := fields["DevVersion"]; dv != "" {
+				fmt.Printf("DevVersion    : %s\n", dv)
+			}
+		}
+		if debug {
+			fmt.Printf("raw /info/device answer: %s\n", strings.TrimSpace(string(payload)))
+		}
 		fmt.Println("no Info blob (or no port fields in it) — defaults stay: http=80 priv=37777 rtsp=554")
+		fmt.Printf("hint: cross-check the blob itself: dh-fwd %s --info\n", serial)
 		return 0
+	}
+	if fields, ferr := infoFields(strings.TrimSpace(string(payload))); ferr == nil {
+		if dv := fields["DevVersion"]; dv != "" {
+			fmt.Printf("DevVersion    : %s\n", dv)
+		}
 	}
 
 	label := func(real int, def int) string {
