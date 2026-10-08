@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -215,5 +216,20 @@ func TestHTTPAccelProbeCache(t *testing.T) {
 	_, ok = tun.accelProbeSize("/missing.js")
 	if ok {
 		t.Errorf("expected cache hit for -1 to return ok=false")
+	}
+}
+
+// Regression 2026-10-08: a chunk body cut before its Content-Length used to
+// parse as success (ErrUnexpectedEOF swallowed) and assemble into a silently
+// truncated ext-all.js — delivered 1493814/1497654, three lost 1280B frames.
+func TestParseHTTPRangeResponseShortBodyIsError(t *testing.T) {
+	raw := "HTTP/1.1 206 Partial Content\r\n" +
+		"Content-Type: application/javascript\r\n" +
+		"Content-Range: bytes 0-307199/1497654\r\n" +
+		"Content-Length: 307200\r\n" +
+		"\r\n" +
+		strings.Repeat("x", 303360) // 3840 bytes short
+	if _, err := parseHTTPRangeResponse([]byte(raw), "/ext/ext-all.js"); err == nil {
+		t.Fatal("truncated chunk body parsed as success — silent truncation regression")
 	}
 }

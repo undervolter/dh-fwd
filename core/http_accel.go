@@ -216,18 +216,33 @@ func (t *Tunnel) accelFetch(path string, totalSize int64) ([]byte, string, error
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			result, err := t.accelDoRangeRequest(path, c.start, c.end)
+			fetch := func() (*accelRangeResult, error) {
+				res, err := t.accelDoRangeRequest(path, c.start, c.end)
+				if err != nil {
+					return nil, err
+				}
+				if res.status != 206 {
+					return nil, fmt.Errorf("got status %d, not 206", res.status)
+				}
+				// Chunk length is part of success: a short body used to
+				// assemble into a silently truncated file (ext-all.js
+				// delivered 1493814/1497654, live 2026-10-08).
+				if want := c.end - c.start + 1; int64(len(res.body)) != want {
+					return nil, fmt.Errorf("short body %d/%d bytes", len(res.body), want)
+				}
+				return res, nil
+			}
+			result, err := fetch()
+			if err != nil {
+				// One retry of the whole chunk: a lost frame costs a
+				// re-bind (~500 ms), a truncated file costs the page.
+				result, err = fetch()
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
 				if fetchErr == nil {
 					fetchErr = fmt.Errorf("chunk %d [%d-%d]: %v", c.idx, c.start, c.end, err)
-				}
-				return
-			}
-			if result.status != 206 {
-				if fetchErr == nil {
-					fetchErr = fmt.Errorf("chunk %d: got status %d, not 206", c.idx, result.status)
 				}
 				return
 			}
@@ -420,7 +435,9 @@ func parseHTTPRangeResponse(raw []byte, path string) (*accelRangeResult, error) 
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
-	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+	// ErrUnexpectedEOF is a failure, not a success: the body ended before
+	// Content-Length, and treating it as OK assembled a truncated file.
+	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("read body: %v", err)
 	}
 

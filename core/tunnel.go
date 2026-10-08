@@ -2633,9 +2633,16 @@ func (t *Tunnel) dispatchAccelData(realm uint32, payload []byte) bool {
 	if ch != nil {
 		cp := make([]byte, len(payload))
 		copy(cp, payload)
+		// Never discard here: the frame is already ACKed by PTCP, so a
+		// drop is permanent and the chunk comes up short (live 2026-10-08:
+		// ext-all.js delivered 1493814/1497654 — three lost 1280B frames).
+		// A live worker drains the buffer in microseconds; the grace only
+		// expires when the reader is already gone.
 		select {
 		case ch <- cp:
-		default:
+		case <-time.After(500 * time.Millisecond):
+			t.logf("accel: realm=%#010x frame dropped — accel channel stalled, reader likely gone", realm)
+		case <-t.done:
 		}
 		return true
 	}
