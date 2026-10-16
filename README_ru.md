@@ -13,6 +13,12 @@
   <img src="https://img.shields.io/github/license/undervolter/dh-fwd?style=flat-square" alt="License">
   <img src="https://img.shields.io/github/downloads/undervolter/dh-fwd/total?style=flat-square&color=blue" alt="Downloads">
 </p>
+
+<p align="center">
+  <h3>⚠️ Этот проект стал неактивным</h3>
+  <em>Это значит что данный репозиторий не будет получать обновлений на неопределённый срок.</em>
+</p>
+
 Софт для создания туннелей к камере Dahua (по серийному номеру) с форвардингом любого порта на localhost через облачный протокол Dahua.
 
 ## Возможности
@@ -20,7 +26,6 @@
 - Поддерживает форвардинг **нескольких портов сразу**
 - Поддерживает подключения к камерам **после 2024 года**
 - Поддерживает многопоточность
-- Строит стабильные туннели к камере
 - Автоапдейтер
 
 > [!CAUTION]
