@@ -12,6 +12,12 @@
   <img src="https://img.shields.io/github/v/release/undervolter/dh-fwd?style=flat-square&color=blue" alt="Release">
   <img src="https://img.shields.io/github/license/undervolter/dh-fwd?style=flat-square" alt="License">
   <img src="https://img.shields.io/github/downloads/undervolter/dh-fwd/total?style=flat-square&color=blue" alt="Downloads">
+  <a href="https://www.repostatus.org/#inactive"><img src="https://www.repostatus.org/badges/latest/inactive.svg" alt="Project Status: Inactive"></a>
+</p>
+
+<p align="center">
+  <h3>⚠️ This project is inactive</h3>
+  <em>That means that this repo won't get updates for an extended period</em>
 </p>
 
 Software for creating tunnels to a Dahua camera (by serial number), forwarding any port to localhost via the Dahua cloud protocol.
@@ -21,8 +27,6 @@ Software for creating tunnels to a Dahua camera (by serial number), forwarding a
 - Supports **forwarding multiple ports at once**
 - Supports connecting to cameras **released after 2024**
 - Supports multithreading
-- Builds stable tunnels to the camera
-- Auto-updater
 
 > [!CAUTION]
 > Before **2024**, Dahua's P2P servers established connections *without authentication*. After all the fuss over the protocol's vulnerability, devices released after 2024.07 now require authentication.
