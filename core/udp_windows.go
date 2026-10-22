@@ -3,6 +3,7 @@
 package core
 
 import (
+	"net"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -35,4 +36,12 @@ func isConnReset(err error) bool {
 	return err == syscall.ECONNRESET ||
 		err == windows.WSAECONNRESET ||
 		strings.Contains(err.Error(), "connection reset")
+}
+
+func setSocketDF(conn *net.UDPConn) {
+	if sc, err := conn.SyscallConn(); err == nil {
+		_ = sc.Control(func(fd uintptr) {
+			_ = windows.SetsockoptInt(windows.Handle(fd), windows.IPPROTO_IP, 14 /* IP_DONTFRAGMENT */, 1)
+		})
+	}
 }

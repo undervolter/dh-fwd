@@ -39,13 +39,18 @@ func touHeader(typ byte) byte {
 	return touVersionNibble | (typ & 0x0F)
 }
 
-// touBuildSyn — 20 bytes:
+// touBuildSyn — 20 bytes (P2PDll CTcpRelayChannel::sendSyn 0x1800158B0):
 //   [0]=0x11 [1]=0 [2:4]=htons(0) [4:8]=session(BE) [8:14]=0
-//   [14:16]=hint(BE) [16:20]=x(BE)
-func touBuildSyn(session uint32) []byte {
+//   [14:16]=port(BE) [16:20]=127.0.0.1 (0x7F000001)
+func touBuildSyn(session uint32, port ...uint16) []byte {
 	b := make([]byte, touSynSize)
 	b[0] = touHeader(touTypeSyn)
 	binary.BigEndian.PutUint32(b[4:8], session)
+	if len(port) > 0 && port[0] != 0 {
+		binary.BigEndian.PutUint16(b[14:16], port[0])
+		b[16] = 0x7F
+		b[19] = 0x01
+	}
 	return b
 }
 

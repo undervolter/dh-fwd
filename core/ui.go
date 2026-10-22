@@ -1,6 +1,7 @@
 package core
 
 import (
+	"time"
 	"fmt"
 	"io"
 	"strings"
@@ -218,4 +219,42 @@ func (cp *ConnectProgress) render() {
 		line += strings.Repeat(" ", 110-len(line))
 	}
 	fmt.Fprintf(cp.w, "\r%s", line)
+}
+
+// StartUptimeTracker prints an in-place updating uptime counter on stdout.
+func StartUptimeTracker(done <-chan struct{}) {
+	startTime := time.Now()
+	ticker := time.NewTicker(1 * time.Second)
+	go func() {
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				elapsed := time.Since(startTime).Round(time.Second)
+				h := int(elapsed.Hours())
+				m := int(elapsed.Minutes()) % 60
+				s := int(elapsed.Seconds()) % 60
+				var timeStr string
+				if h > 0 {
+					timeStr = fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+				} else {
+					timeStr = fmt.Sprintf("%02d:%02d", m, s)
+				}
+				fmt.Printf("\r\033[2K\033[33m[!]\033[0m Tunnel closed. Total uptime: %s\n", timeStr)
+				return
+			case <-ticker.C:
+				elapsed := time.Since(startTime).Round(time.Second)
+				h := int(elapsed.Hours())
+				m := int(elapsed.Minutes()) % 60
+				s := int(elapsed.Seconds()) % 60
+				var timeStr string
+				if h > 0 {
+					timeStr = fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+				} else {
+					timeStr = fmt.Sprintf("%02d:%02d", m, s)
+				}
+				fmt.Printf("\r\033[36m[*]\033[0m Tunnel uptime: %s", timeStr)
+			}
+		}
+	}()
 }

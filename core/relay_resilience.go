@@ -257,21 +257,35 @@ func (t *Tunnel) zombieWatchdog(done chan struct{}) {
 			age    time.Duration
 			zombie bool
 		)
+		// If we are on direct P2P path (deviceRemote), zombie watchdog is disabled!
+		// Direct P2P has normal TCP retransmits and heartbeat; don't kill tunnels on long-polling HTTP requests.
+		p := t.getPrimary()
+		if p != nil && p == t.deviceRemote {
+			continue
+		}
+
 		t.clientsMu.Lock()
-		for id, c := range t.clients {
-			up = atomic.LoadUint64(&c.dataUp)
-			down := atomic.LoadUint64(&c.dataDown)
-			if up == 0 || down > 0 {
-				continue
-			}
-			if a := now.Sub(c.created); a > zombieRelayTimeout {
-				rid, port, age, zombie = id, c.remotePort, a, true
-				break
+		var totalDown uint64
+		for _, c := range t.clients {
+			totalDown += atomic.LoadUint64(&c.dataDown)
+		}
+		// Only declare zombie if the entire relay path has delivered ZERO bytes back to all clients
+		if totalDown == 0 {
+			for id, c := range t.clients {
+				up = atomic.LoadUint64(&c.dataUp)
+				down := atomic.LoadUint64(&c.dataDown)
+				if up == 0 || down > 0 {
+					continue
+				}
+				if a := now.Sub(c.created); a > zombieRelayTimeout {
+					rid, port, age, zombie = id, c.remotePort, a, true
+					break
+				}
 			}
 		}
 		t.clientsMu.Unlock()
 		if zombie {
-			t.logf("zombie data path: realm=%#010x port=%d sent %d bytes, 0 back for %.0fs — fail for retry (app dialect next)",
+			t.logf("zombie data path: realm=%#010x port=%d sent %d bytes, 0 back for %.0fs (relay deaf) — fail for retry",
 				rid, port, up, age.Seconds())
 			t.forceAppRelay = true
 			t.fail(errZombieRelay)

@@ -10,7 +10,6 @@ package core
 import (
 	"bufio"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
@@ -31,7 +30,7 @@ const (
 	// touReadLoop kills the tunnel when LastRecv exceeds the heartbeat
 	// timeout. At 20 s every silent gap longer than the timeout murdered
 	// healthy channels (live 2026-09-13 audit).
-	tcpRelayKeepaliveEvery = 7 * time.Second
+	tcpRelayKeepaliveEvery = 6 * time.Second // P2PDll 0x1800169D8: 30s / 5 = 6s
 )
 
 // touChannel is a live TOU session channel to the relay agent.
@@ -63,15 +62,15 @@ func dialTCPRelay(prof *appProfile, agentHost string, agentPort int, token strin
 	if ok {
 		_ = tc.SetNoDelay(true)
 	}
-	ch := &touChannel{conn: tc, rd: bufio.NewReaderSize(conn, 4096), debug: debug, logf: logf}
+	ch := &touChannel{conn: tc, rd: bufio.NewReaderSize(conn, touMaxPacketLen), debug: debug, logf: logf}
 
 	// (A1) bind request over the same TCP socket as plain DH HTTP with WSSE.
 	// The verb is the profile's post verb — DHPOST for smartpss (legacy
 	// byte-for-byte), NFPOST for dmss — and the CSeq follows the profile's
 	// dialect too (counter vs random signed int32), not a hardcoded string.
 	myCseq := nextCSeqFor(prof)
-	bindBody, _ := json.Marshal(map[string]string{"Token": token})
-	req := buildDHRequest(prof.verbPost, "/tcprelay/client-bind", string(bindBody), true, myCseq, prof, "", false)
+	bindBody := fmt.Sprintf("<body><Token>%s</Token></body>", token)
+	req := buildDHRequest("POST", "/tcprelay/client-bind", bindBody, true, myCseq, prof, "", false)
 	logf("tcp-relay: >>> bind\n%s", string(req))
 	_ = conn.SetDeadline(time.Now().Add(tcpRelayBindTimeout))
 	if _, err := conn.Write(req); err != nil {

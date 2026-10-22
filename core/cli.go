@@ -190,8 +190,9 @@ func parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 }
 
 func Execute() {
-	var debug, logRetries, infoMode, tcpRelayMode bool
+	var debug, logRetries, infoMode, tcpRelayMode, raceMode bool
 	var smartpssPreset, portTestMode bool
+	var testMTUMode bool
 	var poolSize int
 	var dtype int
 	var username, password, randsalt string
@@ -204,11 +205,13 @@ func Execute() {
 	flag.BoolVar(&debug, "d", false, "debug protocol output")
 	flag.BoolVar(&infoMode, "info", false, "query /info/device/<SN> and decrypt the Info blob (randsalt, devP2PVersion)")
 	flag.BoolVar(&portTestMode, "test", false, "port test: query the Info blob and print the resolved camera ports + forward plan (no tunnel)")
+	flag.BoolVar(&testMTUMode, "test-mtu", false, "Path MTU diagnostic: active PMTUD probe against Dahua cloud")
 	flag.BoolVar(&tcpRelayMode, "R", false, "force the TCP-relay data path (TOU over TCP)")
 	flag.BoolVar(&tcpRelayMode, "tcp-relay", false, "force the TCP-relay data path (TOU over TCP)")
 	flag.BoolVar(&smartpssPreset, "2", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
 	flag.BoolVar(&smartpssPreset, "smartpss", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
 	flag.BoolVar(&smartpssPreset, "smart-pss", false, "SmartPSS preset: forward camera ports 80+37777 on free local ports")
+	flag.IntVar(&GlobalMTU, "mtu", 0, "network MTU override (default: auto-detect from active interface, max 1280)")
 	flag.IntVar(&poolSize, "pool", 50, "pre-bound realms per forwarded port (default 50; 0 disables pooling)")
 	flag.IntVar(&poolSize, "pools", 50, "pre-bound realms per forwarded port (default 50; 0 disables pooling)")
 	var creds string
@@ -228,14 +231,15 @@ func Execute() {
 	flag.IntVar(&threads, "mt", 3, "number of parallel tunnels")
 	flag.BoolVar(&logRetries, "log-retries", false, "log retry details")
 	flag.BoolVar(&logRetries, "lr", false, "log retry details")
-	flag.DurationVar(&hbTimeout, "heartbeat-timeout", 10*time.Second, "PTCP heartbeat timeout")
-	flag.DurationVar(&hbTimeout, "hb", 10*time.Second, "PTCP heartbeat timeout")
+	flag.DurationVar(&hbTimeout, "heartbeat-timeout", 30*time.Second, "PTCP heartbeat timeout")
+	flag.DurationVar(&hbTimeout, "hb", 30*time.Second, "PTCP heartbeat timeout")
 	flag.BoolVar(&ForceAppRelay, "app-relay", false, "force app relay dialect (skips 0x17/0x19 token auth, for 2024+ devices and modern relays)")
 	flag.BoolVar(&ForceAppRelay, "ar", false, "force app relay dialect")
 	flag.StringVar(&appName, "app", "smartpss", "application profile: smartpss (default) or dmss — picks the cloud host, app credentials and request dialect (dmss for devices bound via the DMSS app)")
 	var autoYes bool
 	flag.BoolVar(&autoYes, "y", false, "skip confirmation prompts")
 	flag.BoolVar(&autoYes, "yes", false, "skip confirmation prompts")
+	flag.BoolVar(&raceMode, "race", false, "parallel race application profiles (smartpss vs dmss) and direct STUN vs relay")
 	flag.Usage = usage
 
 	positional, err := parseArgs(flag.CommandLine, os.Args[1:])
@@ -282,6 +286,11 @@ func Execute() {
 		profiles = []*appProfile{p}
 	} else {
 		profiles = profileFallbackOrder()
+	}
+
+	if testMTUMode {
+		RunMTUTest(MAIN_SERVER)
+		return
 	}
 
 	if len(positional) < 1 {
@@ -341,9 +350,9 @@ func Execute() {
 
 
 	if multi {
-		runMulti(serial, profiles, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit)
+		runMulti(serial, profiles, specs, threads, dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit, raceMode)
 	} else {
-		runSingle(serial, profiles, specs[0], dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit)
+		runSingle(serial, profiles, specs[0], dtype, username, password, randsalt, debug, logRetries, tcpRelayMode, poolSize, poolExplicit, raceMode)
 	}
 }
 
@@ -362,9 +371,15 @@ General:
                                   from the Info blob (httpport/privport/
                                   rtspport) and print the forward plan,
                                   no tunnel
+  --test-mtu                      run active Path MTU Discovery probe against
+                                  Dahua cloud and print diagnostics
   --app-relay, -ar                force app relay dialect (skips 0x17/0x19
                                   token auth on modern devices / relays)
+  --race                          race application profiles (smartpss vs dmss)
+                                  in parallel for fastest connection
   --tcp-relay, -R                 force the TCP-relay data path (TOU over TCP)
+  --mtu <bytes>                   network MTU override (default: auto-detect
+                                  from active interface, max 1280)
   --smartpss, --smart-pss, -2     SmartPSS preset: forward 80+37777 on free
                                   local ports (DVRIP + web/API channels)
   --pool, --pools <n>             pre-bound realms per forwarded port
@@ -609,9 +624,97 @@ func makePortSpecs(locals, remotes []int) ([]PortSpec, error) {
 	return specs, nil
 }
 
-func runSingle(serial string, profiles []*appProfile, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool) {
+func runSingleRace(serial string, profiles []*appProfile, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool) {
+	target := fmt.Sprintf("%s:%d", serial, spec.Remote)
+	profNames := make([]string, len(profiles))
+	for i, p := range profiles {
+		profNames[i] = p.displayName()
+	}
+	fmt.Printf("[*] Parallel Racing %d profiles: [%s]\n", len(profiles), strings.Join(profNames, ", "))
+
+	type raceResult struct {
+		prof   *appProfile
+		tunnel *Tunnel
+		err    error
+	}
+
+	resultCh := make(chan raceResult, len(profiles))
+	tunnels := make([]*Tunnel, len(profiles))
+
+	cp := NewConnectProgress(os.Stdout, target)
+
+	for i, prof := range profiles {
+		g := specGroup{idxs: []int{0}, specs: []PortSpec{spec}}
+		t := newTunnel(serial, prof, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, poolExplicit, g, nil)
+		t.progress = cp
+		tunnels[i] = t
+
+		go func(p *appProfile, tun *Tunnel) {
+			err := tun.handshake()
+			resultCh <- raceResult{prof: p, tunnel: tun, err: err}
+		}(prof, t)
+	}
+
+	var winner *Tunnel
+	var winnerProf *appProfile
+	var first404 bool
+	failedCount := 0
+
+	for failedCount < len(profiles) {
+		res := <-resultCh
+		if res.err == nil {
+			winner = res.tunnel
+			winnerProf = res.prof
+			break
+		}
+		if errors.Is(res.err, errDeviceNotFound) {
+			first404 = true
+		}
+		failedCount++
+		writeLog("Profile %s race attempt failed: %v", res.prof.displayName(), res.err)
+	}
+
+	// Close all losing tunnels immediately
+	for _, tun := range tunnels {
+		if tun != winner {
+			tun.close()
+		}
+	}
+
+	if winner == nil {
+		cp.Fail("failed")
+		if first404 {
+			deviceNotFound(serial)
+		} else {
+			fmt.Fprintf(os.Stderr, "All profiles failed during parallel race\n")
+		}
+		os.Exit(1)
+	}
+
+	writeLog("Profile %s WON the race! Serving port :%d -> :%d", winnerProf.displayName(), spec.Local, spec.Remote)
+	if err := winner.serve(); err != nil {
+		if errors.Is(err, errZombieRelay) {
+			writeLog("zombie relay detected — recovering with app relay dialect")
+			winner.reset()
+			runWithRetries(winner, cp, func(err error) {
+				fmt.Fprintf(os.Stderr, "Tunnel failed: %v\n", err)
+				os.Exit(1)
+			})
+			return
+		}
+		fmt.Fprintf(os.Stderr, "Tunnel serve error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runSingle(serial string, profiles []*appProfile, spec PortSpec, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool, raceMode bool) {
 	target := fmt.Sprintf("%s:%d", serial, spec.Remote)
 	showHeader := len(profiles) > 1
+
+	if raceMode && len(profiles) > 1 {
+		runSingleRace(serial, profiles, spec, dtype, username, password, randsalt, debug, logRetries, tcpRelay, poolSize, poolExplicit)
+		return
+	}
 
 	for pi, prof := range profiles {
 		if showHeader && pi == 0 {
@@ -762,24 +865,46 @@ func distribute(specs []PortSpec, threads int) []specGroup {
 	return groups
 }
 
-func runMulti(serial string, profiles []*appProfile, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool) {
+func runMulti(serial string, profiles []*appProfile, specs []PortSpec, threads int, dtype int, username, password, randsalt string, debug, logRetries bool, tcpRelay bool, poolSize int, poolExplicit bool, raceMode bool) {
 	showHeader := len(profiles) > 1
 
-	// Try each profile until verifyDevice succeeds.
 	var prof *appProfile
 	salt := randsalt
-	for pi, p := range profiles {
-		if showHeader {
-			if pi > 0 {
-				fmt.Print("\033[A\r\033[2K")
-			}
-			fmt.Printf("[%d/%d] Trying %s profile\n", pi+1, len(profiles), p.displayName())
+	if raceMode && len(profiles) > 1 {
+		fmt.Printf("[*] Parallel Racing %d profiles verification...\n", len(profiles))
+		type vResult struct {
+			prof *appProfile
+			salt string
+			ok   bool
 		}
+		vch := make(chan vResult, len(profiles))
+		for _, p := range profiles {
+			go func(pr *appProfile) {
+				ok, s := verifyDevice(serial, pr, dtype, username, password, randsalt, specs, debug)
+				vch <- vResult{prof: pr, salt: s, ok: ok}
+			}(p)
+		}
+		for i := 0; i < len(profiles); i++ {
+			res := <-vch
+			if res.ok && prof == nil {
+				prof = res.prof
+				salt = res.salt
+			}
+		}
+	} else {
+		for pi, p := range profiles {
+			if showHeader {
+				if pi > 0 {
+					fmt.Print("\033[A\r\033[2K")
+				}
+				fmt.Printf("[%d/%d] Trying %s profile\n", pi+1, len(profiles), p.displayName())
+			}
 		ok, s := verifyDevice(serial, p, dtype, username, password, randsalt, specs, debug)
 		if ok {
 			prof = p
 			salt = s
 			break
+		}
 		}
 	}
 	if prof == nil {
@@ -910,6 +1035,8 @@ func runMulti(serial string, profiles []*appProfile, specs []PortSpec, threads i
 			} else {
 				fmt.Println("\033[32m[+]\033[0m Connected via direct path!")
 			}
+			multiDone := make(chan struct{})
+			StartUptimeTracker(multiDone)
 			summarized = true
 		}
 	}

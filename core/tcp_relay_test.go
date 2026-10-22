@@ -138,7 +138,7 @@ func TestDialTCPRelayBindRequestShape(t *testing.T) {
 			bind, synSes := agent.recorded()
 
 			// Status line: profile post verb + the fixed bind path.
-			wantLine := prof.verbPost + " /tcprelay/client-bind HTTP/1.1\r\n"
+			wantLine := "POST /tcprelay/client-bind HTTP/1.1\r\n"
 			if !strings.HasPrefix(bind, wantLine) {
 				t.Fatalf("%s bind does not start with %q:\n%s", prof.name, wantLine, bind)
 			}
@@ -158,7 +158,7 @@ func TestDialTCPRelayBindRequestShape(t *testing.T) {
 			}
 
 			// Token body with a matching Content-Length.
-			const wantBody = `{"Token":"T0KEN"}`
+			const wantBody = `<body><Token>T0KEN</Token></body>`
 			if !strings.HasSuffix(bind, "\r\n\r\n"+wantBody) {
 				t.Fatalf("%s bind body missing %q:\n%s", prof.name, wantBody, bind)
 			}

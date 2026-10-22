@@ -25,7 +25,7 @@ const (
 )
 
 var (
-	HEARTBEAT_TIMEOUT  = 10 * time.Second
+	HEARTBEAT_TIMEOUT  = 30 * time.Second // P2PDll CTcpRelayChannel::heartbeat 0x180016980 (30000 ms)
 	RELAY_READ_TIMEOUT = 15 * time.Second
 )
 
@@ -35,8 +35,9 @@ var (
 // continuous silence. SmartPSS tolerates exactly this: short stalls recover
 // on the punched path, only a dead device costs a rebuild.
 var (
-	rePunchEvery  = 4 * time.Second
-	silenceGiveUp = 30 * time.Second
+	rePunchSilence = 15 * time.Second
+	rePunchEvery   = 4 * time.Second
+	silenceGiveUp  = 45 * time.Second
 )
 
 // Bounded reads for the best-effort relay-dispatcher exchange
@@ -282,6 +283,10 @@ type Tunnel struct {
 	// 2024+ forceAppRelay). The operator asked for it — honor it, even if
 	// pre-bound realms may go stale device-side on those dialects.
 	poolExplicit bool
+
+	// Wire-safe MTU and PTCP segment sizing (auto-detected or forced via --mtu).
+	userMTU    int
+	segmentMax int
 }
 
 // poolState is the per-port pool. All fields guarded by poolMu.
@@ -311,7 +316,7 @@ func (t *Tunnel) setPrimaryRelay(u *UDP) {
 	t.setPrimary(u)
 }
 
-func newTunnel(serial string, prof *appProfile, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, poolExplicit bool, g specGroup, reg *PortRegistry) *Tunnel {
+func newTunnel(serial string, prof *appProfile, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, poolExplicit bool, g specGroup, reg *PortRegistry, mtu ...int) *Tunnel {
 	// The app relay dialect binds each realm FRESH, seconds before use
 	// (capture: BIND †’ 0x12 CONN †’ DATA, ~6 ms apart). Pre-bound realms go
 	// stale device-side and their DATA is discarded, so pooling is disabled
@@ -319,6 +324,10 @@ func newTunnel(serial string, prof *appProfile, dtype int, username, password, r
 	// explicitly (poolExplicit): an explicit level always wins.
 	if prof != nil && prof.noRelayAuth && poolSize > 0 && !poolExplicit {
 		poolSize = 0
+	}
+	mtuVal := GlobalMTU
+	if len(mtu) > 0 && mtu[0] > 0 {
+		mtuVal = mtu[0]
 	}
 	t := &Tunnel{
 		serial:       serial,
@@ -336,6 +345,11 @@ func newTunnel(serial string, prof *appProfile, dtype int, username, password, r
 		specIdx:      g.idxs,
 		reg:          reg,
 		cseqCounter:  CSEQ_BASE,
+		userMTU:      mtuVal,
+		segmentMax:   dataSegmentMax,
+	}
+	if mtuVal > 0 {
+		t.segmentMax = resolveSegmentMax("", mtuVal, false, nil)
 	}
 	if reg != nil {
 		t.ui = reg.ui
@@ -721,6 +735,7 @@ func (t *Tunnel) waitForPTCPToken(u *UDP, timeout time.Duration) (*PTCP, error) 
 // (relay agent).
 func (t *Tunnel) establish() error {
 	mainRemote := NewUDP(t.profile.mainServer, t.profile.mainPort, t.debug, t.profile)
+	t.segmentMax = resolveSegmentMax(t.profile.mainServer, t.userMTU, false, t.logf)
 	mainRemote.debugLog = t.logf
 	t.socksMu.Lock()
 	t.mainRemote = mainRemote
@@ -908,7 +923,7 @@ func (t *Tunnel) establish() error {
 		return fmt.Errorf("device response: code=%d %s", res.Code, res.Status)
 	}
 
-	if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+	if v := res.Body["body/version"]; strings.HasPrefix(v, "5.") || strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") || strings.HasPrefix(v, "8.") {
 		t.forceAppRelay = true
 		if t.poolExplicit {
 			t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
@@ -920,6 +935,11 @@ func (t *Tunnel) establish() error {
 
 	deviceLaddr := res.Body["body/LocalAddr"]
 	devicePub := res.Body["body/PubAddr"]
+	peerValueTStr := res.Body["body/NatValueT"]
+	peerValueT := 0
+	if peerValueTStr != "" {
+		peerValueT, _ = strconv.Atoi(peerValueTStr)
+	}
 
 	if t.dtype > 0 {
 		nonceStr := res.Body["body/Nonce"]
@@ -948,99 +968,94 @@ func (t *Tunnel) establish() error {
 	// without an agent either (zero such traffic in the captures).
 	// If the relay agent doesn't ack in time we retry once: cloud sometimes
 	// takes a few extra seconds to propagate the relay assignment.
-	if agentOK {
-		t.statusf(PhaseRelayChannel, "relay-channel")
+	policy := res.Body["body/Policy"]
+	tcpRelayAllowed := strings.Contains(policy, "tcprelay")
+
+	// Forced TCP-relay mode: request real TCP relay agent and attach TOU channel
+	if t.useTCP {
+		t.statusf(PhaseRelayChannel, "tcprelay-channel")
 		authStr := ""
 		if t.dtype > 0 {
 			nonce2 := getNonce()
 			authStr = getAuth(t.username, xchg.req.key, nonce2, "", t.randsalt)
 		}
-		if err := t.waitRelayChannelAck(mainRemote, agentHost, agentPort, authStr); err != nil {
-			if t.useTCP {
-				return err
-			}
-			t.logf("relay-channel ack timed out (%v) — continuing to STUN punch without relay agent", err)
-			agentOK = false
-		}
-	}
-
-	policy := res.Body["body/Policy"]
-	tcpRelayAllowed := strings.Contains(policy, "tcprelay")
-
-	// Forced TCP-relay mode: try TOU over TCP, but gracefully fall back if unavailable.
-	if t.useTCP {
-		if !agentOK {
-			fmt.Printf("\r%-110s\r[-] TCP relay unavailable - falling back to UDP\n", "")
-			t.logf("TCP relay forced but no relay agent is available — falling back to UDP")
+		tcpHost, tcpPort, tcpToken, err := t.waitTcpRelayChannel(mainRemote, authStr)
+		if err != nil {
+			fmt.Printf("\r%-110s\r[-] TCP relay unavailable (%v) - falling back to UDP\n", "", err)
+			t.logf("TCP relay unavailable (%v) - falling back to UDP", err)
 			t.useTCP = false
 		} else {
 			t.statusf(PhasePTCPHandshake, "TCP relay attach")
-			if err := t.attachTCPRelay(agentHost, agentPort, agentToken); err != nil {
-				fmt.Printf("\r%-110s\r[-] TCP relay unavailable - falling back to UDP\n", "")
-				t.logf("TCP relay forced failed (%v) — falling back to UDP", err)
+			if err := t.attachTCPRelay(tcpHost, tcpPort, tcpToken); err != nil {
+				fmt.Printf("\r%-110s\r[-] TCP relay attach failed (%v) - falling back to UDP\n", "", err)
+				t.logf("TCP relay attach failed (%v) - falling back to UDP", err)
 				t.useTCP = false
 			} else {
-				t.logf("TCP relay channel attached (forced)")
+				t.logf("TCP relay channel attached (forced) to %s:%d", tcpHost, tcpPort)
 				return nil
 			}
 		}
 	}
 
-	// PTCP over relay: SYNC then token request (0x17 -> 0x18). Only with an
-	// allocated agent — without one (dmss best-effort) the punched direct
-	// channel is the only data path, so establishment falls straight through
-	// to the NAT punch below. forceAppRelay (zombie retry) skips the whole
-	// exchange: on 2024+ generations the 0x17/0x19 pair on the data socket
-	// invalidates the channel — BINDs get relay-fabricated 0x12 CONN acks
-	// but DATA is never routed.
-	var sign []byte
+	// =========================================================================
+	// PARALLEL RACE: Relay Channel setup vs Direct STUN Punch
+	// =========================================================================
+	var (
+		relayErr  error
+		relayDone = make(chan struct{})
+	)
+
+	// Launch Relay Agent setup in background
 	if agentOK {
-		t.statusf(PhaseNATPunch, "PTCP sync")
-		mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
-		t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-		p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
-		if err != nil {
-			// UDP relay path dead — try the TCP relay channel if the device
-			// advertises tcprelay support in its policy list.
-			if tcpRelayAllowed {
-				t.logf("ptcp sync over UDP failed (%v) — policy allows tcprelay, trying TCP relay", err)
-				t.statusf(PhasePTCPHandshake, "TCP relay fallback")
-				if aerr := t.attachTCPRelay(agentHost, agentPort, agentToken); aerr == nil {
-					t.logf("TCP relay channel attached (fallback)")
-					return nil
-				} else {
-					t.logf("TCP relay fallback failed: %v", aerr)
-				}
+		go func() {
+			defer close(relayDone)
+			t.statusf(PhaseRelayChannel, "relay-channel")
+			authStr := ""
+			if t.dtype > 0 {
+				nonce2 := getNonce()
+				authStr = getAuth(t.username, xchg.req.key, nonce2, "", t.randsalt)
 			}
-			return fmt.Errorf("ptcp sync: %v", err)
-		}
-
-		// Complete the 3-way PTCP handshake by acknowledging the relay's SYNC frame.
-		mainRemote.RequestPTCP(nil)
-
-		if !t.profile.noRelayAuth && !t.forceAppRelay && !ForceAppRelay {
-			t.statusf(PhaseNATPunch, "PTCP token")
-			mainRemote.RequestPTCP([]byte{
-				0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00,
-			})
-			t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-			p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
+			if err := t.waitRelayChannelAck(mainRemote, agentHost, agentPort, authStr); err != nil {
+				t.logf("relay-channel ack timed out (%v)", err)
+				relayErr = err
+				return
+			}
+			t.statusf(PhaseNATPunch, "PTCP sync")
+			mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+			t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+			p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
 			if err != nil {
-				if errors.Is(err, errPTCPAppFallback) {
-					t.forceAppRelay = true
-					t.logf("ptcp 0x17: token not supported by relay (heartbeat spam), switching to app relay dialect")
-				} else {
-					return fmt.Errorf("ptcp 0x17: %v", err)
-				}
-			} else {
-				sign = p.Body[12:]
-				mainRemote.RequestPTCP(nil)
+				relayErr = err
+				return
 			}
-		}
+			mainRemote.RequestPTCP(nil)
+			if !t.profile.noRelayAuth && !t.forceAppRelay && !ForceAppRelay {
+				t.statusf(PhaseNATPunch, "PTCP token")
+				mainRemote.RequestPTCP([]byte{
+					0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+					0x00, 0x00, 0x00, 0x00,
+				})
+				t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+				p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
+				if err != nil {
+					if errors.Is(err, errPTCPAppFallback) {
+						t.forceAppRelay = true
+						t.logf("ptcp 0x17: token not supported by relay (heartbeat spam), switching to app relay dialect")
+					} else {
+						relayErr = err
+						return
+					}
+				} else {
+					_ = p.Body
+					mainRemote.RequestPTCP(nil)
+				}
+			}
+		}()
+	} else {
+		close(relayDone)
 	}
 
-	// Inverted STUN punch (Level 2): build the Init packet from the AID.
+	// Concurrent Inverted STUN punch (Level 2)
 	t.statusf(PhaseNATPunch, "NAT punch")
 	invAid := make([]byte, 8)
 	for i, b := range aid {
@@ -1071,68 +1086,126 @@ func (t *Tunnel) establish() error {
 	localPortVal, _ := strconv.Atoi(localPortStr)
 
 	t.logf(":%d >>> %s:%d (LocalAddr)", deviceRemote.lport, localIPStr, localPortVal)
-	t.logf(":%d >>> %s:%d (PubAddr)", deviceRemote.lport, devParts[0], devPort)
+	t.logf(":%d >>> %s:%d (PubAddr, peerValueT=%d)", deviceRemote.lport, devParts[0], devPort, peerValueT)
 
-	deviceRemote.SendTo(stunInit, &net.UDPAddr{IP: net.ParseIP(localIPStr), Port: localPortVal})
-	deviceRemote.Send(stunInit)
+	var localUDP *net.UDPAddr
+	if localPortVal > 0 {
+		localUDP = &net.UDPAddr{IP: net.ParseIP(localIPStr), Port: localPortVal}
+	}
+	devIP := net.ParseIP(devParts[0])
+
+	sendBurst := func() {
+		if localUDP != nil {
+			deviceRemote.SendTo(stunInit, localUDP)
+		}
+		deviceRemote.Send(stunInit)
+		if devIP != nil {
+			step := 1
+			if peerValueT > 1 && peerValueT <= 8 {
+				step = peerValueT
+			}
+			// SmartPSS Symmetric NAT parity: sweep predicted port window
+			for off := step; off <= 64; off += step {
+				deviceRemote.SendTo(stunInit, &net.UDPAddr{IP: devIP, Port: devPort + off})
+			}
+		}
+	}
+
+	sendBurst()
 
 	var stunResponse []byte
-	deviceRemote.SetTimeout(2 * time.Second)
-	deadline := time.Now().Add(10 * time.Second)
+	deviceRemote.SetTimeout(300 * time.Millisecond)
+	deadline := time.Now().Add(4 * time.Second)
 	attempt := 0
+	maxAttempts := 10
 
 	for time.Now().Before(deadline) {
+		deviceRemote.SetTimeout(300 * time.Millisecond)
 		data, addr, err := deviceRemote.RecvFrom(4096)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				attempt++
-				if attempt <= 2 {
-					t.logf("Retransmit STUN init (attempt %d)", attempt)
-					deviceRemote.Send(stunInit)
+				if attempt < maxAttempts {
+					t.logf("Retransmit STUN init (attempt %d/%d)", attempt, maxAttempts)
+					sendBurst()
 					continue
 				}
 				break
 			}
 			break
 		}
-		magic := data[:4]
-		t.logf("STUN <<< %s magic=%x len=%d", addr, magic, len(data))
-
 		if len(data) < 20 {
-			t.logf("STUN <<< short datagram (%d bytes) — ignored", len(data))
+			t.logf("STUN <<< short datagram (%d bytes) - ignored", len(data))
 			continue
 		}
 
-		if string(magic) == "\xFE\xFE\xFF\xE7" {
+		magic := data[:4]
+		t.logf("STUN <<< %s magic=%x len=%d", addr, magic, len(data))
+
+		// Dahua STUN Binding Success Response: 0x0101 XOR 0xFFFF = 0xFEFE
+		if data[0] == 0xFE && data[1] == 0xFE {
 			stunResponse = data
-			t.logf("Got STUN response (fefeffe7)")
-			break
-		} else if string(magic) == "\xFF\xFE\xFF\xE7" {
-			if len(data) < 40 {
-				t.logf("STUN <<< cross-STUN init too short (%d bytes) — ignored", len(data))
-				continue
+			t.logf("Got STUN response (magic=%02x%02x len=%d from %s)", data[0], data[1], len(data), addr)
+			if addr != nil {
+				deviceRemote.SetRemote(addr.IP.String(), addr.Port)
+				devParts[0] = addr.IP.String()
+				devPort = addr.Port
+				devParts[1] = strconv.Itoa(devPort)
+				t.logf("STUN: locked deviceRemote endpoint to %s:%d", devParts[0], devPort)
 			}
-			t.logf("Got device cross-STUN init (fffeffe7), responding...")
+			break
+		} else if data[0] == 0xFF && data[1] == 0xFE {
+			// Dahua STUN Binding Request from device: 0x0001 XOR 0xFFFF = 0xFFFE
+			t.logf("Got device cross-STUN init (magic=%02x%02x from %s), responding...", data[0], data[1], addr)
+			if addr != nil {
+				deviceRemote.SetRemote(addr.IP.String(), addr.Port)
+				devParts[0] = addr.IP.String()
+				devPort = addr.Port
+				devParts[1] = strconv.Itoa(devPort)
+				t.logf("STUN: locked deviceRemote endpoint to %s:%d", devParts[0], devPort)
+			}
 			resp := make([]byte, 0, 40)
 			resp = append(resp, []byte{0xFE, 0xFE, 0xFF, 0xE7}...)
-			resp = append(resp, data[4:8]...)
-			resp = append(resp, data[8:20]...)
+			if len(data) >= 8 {
+				resp = append(resp, data[4:8]...)
+			} else {
+				resp = append(resp, cookie...)
+			}
+			if len(data) >= 20 {
+				resp = append(resp, data[8:20]...)
+			} else {
+				resp = append(resp, transID...)
+			}
 			resp = append(resp, []byte{0x7F, 0xD6, 0xFF, 0xF7}...)
 			resp = append(resp, invAid...)
-			resp = append(resp, []byte{0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE}...)
-			resp = append(resp, data[34:40]...)
-			deviceRemote.SendTo(resp, addr)
-			t.logf("STUN >>> %s response sent", addr)
+			if len(data) >= 40 {
+				resp = append(resp, []byte{0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE}...)
+				resp = append(resp, data[34:40]...)
+			}
+			for range 3 {
+				deviceRemote.SendTo(resp, addr)
+			}
+			t.logf("STUN >>> %s response sent (x3)", addr)
+			stunResponse = data
+			break
 		} else {
-			t.logf("Unknown magic: %x", magic)
+			t.logf("Unknown STUN magic: %x", magic)
 		}
 	}
 
 	if stunResponse == nil {
-		if !agentOK {
-			// No relay agent to fall back on (dmss best-effort allocation):
-			// without the punched channel there is no data path at all.
-			return fmt.Errorf("STUN punch failed and no relay agent available — no data path")
+		// STUN punch failed or timed out: fall back to Relay
+		<-relayDone
+		if relayErr != nil || !agentOK {
+			if tcpRelayAllowed {
+				t.logf("STUN and UDP relay failed (%v) — policy allows tcprelay, trying TCP relay", relayErr)
+				t.statusf(PhasePTCPHandshake, "TCP relay fallback")
+				if aerr := t.attachTCPRelay(agentHost, agentPort, agentToken); aerr == nil {
+					t.logf("TCP relay channel attached (fallback)")
+					return nil
+				}
+			}
+			return fmt.Errorf("STUN punch failed and relay unavailable (%v)", relayErr)
 		}
 		t.logf("STUN failed — using relay agent as the data path")
 		t.statusf(PhasePTCPHandshake, "relay path")
@@ -1141,7 +1214,7 @@ func (t *Tunnel) establish() error {
 		return nil
 	}
 
-	// Confirm the direct channel with a burst of 5 Binding Confirms.
+	// STUN punch succeeded! Confirm direct channel with 5 Binding Confirms
 	t.statusf(PhasePTCPHandshake, "PTCP handshake")
 	confirm := []byte{0xFE, 0xFE, 0xFF, 0xF3}
 	confirm = append(confirm, cookie...)
@@ -1154,8 +1227,8 @@ func (t *Tunnel) establish() error {
 		deviceRemote.Send(confirm)
 	}
 
-	time.Sleep(300 * time.Millisecond)
-	deviceRemote.SetTimeout(500 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+	deviceRemote.SetTimeout(300 * time.Millisecond)
 	for {
 		data, addr, err := deviceRemote.RecvFrom(4096)
 		if err != nil {
@@ -1165,42 +1238,15 @@ func (t *Tunnel) establish() error {
 	}
 	deviceRemote.SetTimeout(0)
 
-	// Direct path: full PTCP auth handshake with the sign token. The
-	// forceAppRelay retry (zombie watchdog) takes the app-parity branch too:
-	// the previous attempt's 0x17/0x19 exchange is the likely reason the
-	// device stopped routing DATA.
-	if t.profile.noRelayAuth || t.forceAppRelay || ForceAppRelay {
-		// App relay dialect (capture 2026-09-06, spike/capture/dmss-capture2.pcap):
-		// after the STUN exchange the client sends exactly ONE PTCP SYNC and
-		// then BIND/DATA — never the 0x17 token request or 0x19 auth. The
-		// device answers a 0x19 with body 0x00 on this generation, and the
-		// 0x17/0x19 traffic on the data socket appears to invalidate the
-		// channel: BINDs still get relay-fabricated 0x12 CONN acks but DATA
-		// is never routed.
-		t.logf("app-parity data path: SYNC only, no 0x17/0x19 auth (dmss relay dialect)")
-		deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
-		if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
-			t.logf("app-parity sync: %v (continuing on the punched channel)", err)
-		}
-		t.statusf(PhasePTCPHandshake, "relay path")
-		t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
-		t.setPrimary(deviceRemote)
-		return nil
+	// Direct P2P data path: STUN punch succeeded!
+	// Fresh P2P channels NEVER need link-switch pause/resume (0x17/0x19).
+	// We only do PTCP SYNC, establish direct path, and start streaming immediately.
+	t.logf("direct data path: SYNC only, no link-switch 0x17/0x19 (pure P2P)")
+	deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+	if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
+		t.logf("direct ptcp sync: %v (continuing on punched channel)", err)
 	}
-	if err := ptcpHandshake(deviceRemote, sign); err != nil {
-		// The STUN punch succeeded but the device rejected the direct 0x19
-		// auth (observed live 2026-09-06, Picoo F1 4G: every punch completes
-		// and every auth answers body 0x00 — while the relay path serves
-		// video fine). Degrade to the relay agent instead of failing the
-		// port — the pre-noRelayAuth fallback (dmss sessions take the
-		// app-parity branch above and never reach this).
-		t.logf("ptcp device handshake failed (%v) — using relay agent as the data path", err)
-		t.statusf(PhasePTCPHandshake, "relay path")
-		setPrimaryRelay := func(u *UDP) { t.setPrimary(u) }
-		setPrimaryRelay(mainRemote)
-		return nil
-	}
-	t.logf("PTCP handshake complete (direct)")
+	t.statusf(PhasePTCPHandshake, "direct path")
 	t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
 	t.setPrimary(deviceRemote)
 	return nil
@@ -1218,6 +1264,46 @@ func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) e
 	t.useTCPPath = true
 	t.socksMu.Unlock()
 	return nil
+}
+
+// waitTcpRelayChannel requests a dedicated TCP relay agent from the device upstream server.
+func (t *Tunnel) waitTcpRelayChannel(remote *UDP, authStr string) (string, int, string, error) {
+	reqPath := fmt.Sprintf("/device/%s/tcprelay-channel", t.serial)
+	reqBody := fmt.Sprintf("<body>%s</body>", authStr)
+	cseq := nextCSeqFor(t.profile)
+
+	_, err := remote.RequestEx(reqPath, reqBody, true, false, reqOpts{cseq: cseq})
+	if err != nil {
+		return "", 0, "", fmt.Errorf("tcprelay-channel request: %w", err)
+	}
+
+	res, err := remote.Read(true, RELAY_READ_TIMEOUT)
+	if err != nil {
+		return "", 0, "", fmt.Errorf("tcprelay-channel read: %w", err)
+	}
+	if res == nil {
+		return "", 0, "", fmt.Errorf("tcprelay-channel response is nil")
+	}
+	if res.Code != 200 {
+		return "", 0, "", fmt.Errorf("tcprelay-channel response: %d %s", res.Code, res.Status)
+	}
+
+	agentStr := res.Body["body/Agent"]
+	tokenStr := res.Body["body/Token"]
+	if agentStr == "" || tokenStr == "" {
+		return "", 0, "", fmt.Errorf("tcprelay-channel missing Agent (%s) or Token (%s)", agentStr, tokenStr)
+	}
+
+	parts := strings.SplitN(agentStr, ":", 2)
+	if len(parts) != 2 {
+		return "", 0, "", fmt.Errorf("invalid Agent address: %s", agentStr)
+	}
+	port, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", 0, "", fmt.Errorf("invalid Agent port: %s", parts[1])
+	}
+
+	return parts[0], port, tokenStr, nil
 }
 
 // waitChannelEarlyAck implements the DMSS app's p2p-channel retransmission:
@@ -1285,7 +1371,7 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 			if t.debug {
 				t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
 			}
-			if v := res.Body["body/version"]; strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") {
+			if v := res.Body["body/version"]; strings.HasPrefix(v, "5.") || strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") || strings.HasPrefix(v, "8.") {
 				t.forceAppRelay = true
 				if t.poolExplicit {
 					t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
@@ -1581,6 +1667,7 @@ func (t *Tunnel) serve() error {
 		} else {
 			fmt.Println("\033[33m[!]\033[0m STUN punch failed! Using relay path (can be unstable)")
 		}
+		StartUptimeTracker(t.done)
 	} else if t.ui == nil && t.progress == nil {
 		for _, o := range oks {
 			fmt.Printf("Listening on port %d, remote port %d\n", o.port, o.remote)
@@ -1659,9 +1746,9 @@ func (t *Tunnel) readLoop(done chan struct{}, u *UDP) {
 						t.fail(fmt.Errorf("heartbeat timeout: no PTCP on primary socket for %v", silent.Round(time.Second)))
 						return
 					}
-					// Past the first timeout: try to re-open the degraded
+					// Past rePunchSilence: try to re-open the degraded
 					// NAT path in place before tearing anything down.
-					if silent > HEARTBEAT_TIMEOUT {
+					if silent > rePunchSilence {
 						t.tryRePunch()
 					}
 				}
@@ -1949,15 +2036,8 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 	// HTTP accelerator: for port-80 connections, try parallel Range fetch to
 	// overcome relay bandwidth limits (~59 KB/s per realm → ~295 KB/s with 5).
 	// Only on the UDP data path; TCP relay has its own flow control.
-	if ac.remotePort == 80 && !t.useTCPPath {
-		res := t.httpAccelHandler(ac.conn)
-		if res.handled {
-			return
-		}
-		if res.replacement != nil {
-			ac.conn = res.replacement
-		}
-	}
+	// HTTP accelerator disabled: direct PTCP streaming for port 80
+	// if ac.remotePort == 80 && !t.useTCPPath { ... }
 
 	if !t.useTCPPath {
 		if realmID, ok := t.popRealm(ac.remotePort); ok {
@@ -1980,7 +2060,7 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 			t.delClient(realmID)
 			return
 		}
-		if err := ch.write(touBuildSyn(realmID)); err != nil {
+		if err := ch.write(touBuildSyn(realmID, uint16(ac.remotePort))); err != nil {
 			t.logf("tcp-relay SYN failed realm=%#010x: %v", realmID, err)
 			t.delClient(realmID)
 			ac.conn.Close()
@@ -2093,18 +2173,17 @@ func (t *Tunnel) delClient(realmID uint32) {
 	}
 }
 
-// dataSegmentMax matches the device's own segmentation observed in the
-// capture (1316-byte datagrams = 1280-byte DATA payloads): sending larger
-// frames triggers IP fragmentation and raises loss probability.
-const dataSegmentMax = 1280
-
 // writeRealmData pushes one realm payload down the active data path,
-// segmented to wire-safe sizes.
+// segmented to wire-safe sizes (auto-tuned or Dahua CProxySession parity).
 func (t *Tunnel) writeRealmData(realm uint32, data []byte) {
+	segMax := t.segmentMax
+	if segMax <= 0 {
+		segMax = dataSegmentMax
+	}
 	for len(data) > 0 {
 		n := len(data)
-		if n > dataSegmentMax {
-			n = dataSegmentMax
+		if n > segMax {
+			n = segMax
 		}
 		chunk := data[:n]
 		if t.useTCPPath {
@@ -2183,7 +2262,16 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 			return
 		}
 		if ch := t.takeBindWait(realm); ch != nil {
-			close(ch)
+			if !isDisc {
+				close(ch)
+				return
+			}
+			t.dropRealm(realm)
+			return
+		}
+		// Only discard/disconnect on an actual DISC frame.
+		// Duplicate 0x12 CONN/ACK frames from retransmissions must NOT close active clients.
+		if !isDisc {
 			return
 		}
 		t.dropRealm(realm) // device discarded a pooled realm
