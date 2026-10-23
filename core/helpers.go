@@ -312,6 +312,14 @@ func parseXML(data string) map[string]string {
 // ICMP port-unreachable poisons the next read with WSAECONNRESET).
 // ---------------------------------------------------------------------------
 
+type ptcpSegment struct {
+	seq     uint32
+	endSeq  uint32
+	raw     []byte
+	sentAt  time.Time
+	retries int
+}
+
 type UDP struct {
 	conn *net.UDPConn
 
@@ -344,6 +352,11 @@ type UDP struct {
 
 	ackFrames uint32
 	lastAck   time.Time
+
+	ptcpSegments []*ptcpSegment
+	peerAck      uint32
+	lastAckSeen  uint32
+	dupAckCount  int
 
 	rxMu     sync.Mutex
 	rxBuf    []byte // reusable receive buffer (single reader per socket)
@@ -734,6 +747,36 @@ func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
 		u.ptcpRecv = ptcp.Rlid + uint32(len(ptcp.Body))
 	}
 	u.rmid = ptcp.Lmid
+
+	// Advance peer ACK and prune confirmed in-flight data segments
+	if ptcp.Llid > u.peerAck {
+		u.peerAck = ptcp.Llid
+	}
+	if len(u.ptcpSegments) > 0 {
+		var remaining []*ptcpSegment
+		for _, seg := range u.ptcpSegments {
+			if seg.endSeq > ptcp.Llid {
+				remaining = append(remaining, seg)
+			}
+		}
+		u.ptcpSegments = remaining
+
+		// Fast Retransmit on 3 duplicate ACKs (parity with Dahua CPhonyTcp line 89)
+		if ptcp.Llid == u.lastAckSeen && len(u.ptcpSegments) > 0 {
+			u.dupAckCount++
+			if u.dupAckCount == 3 {
+				first := u.ptcpSegments[0]
+				if first.retries < 5 {
+					first.retries++
+					first.sentAt = time.Now()
+					u.Send(first.raw)
+				}
+			}
+		} else if ptcp.Llid > u.lastAckSeen {
+			u.lastAckSeen = ptcp.Llid
+			u.dupAckCount = 0
+		}
+	}
 	u.ptcpMu.Unlock()
 
 	return ptcp, nil
@@ -766,13 +809,44 @@ func (u *UDP) RequestPTCP(body []byte) {
 		Body: body,
 	}
 
+	raw := ptcp.Bytes()
 	u.ptcpSent += uint32(len(body))
 	u.ptcpID++
 	if !isSync && len(body) > 0 {
 		u.ptcpCount++
+		// In-flight buffer for reliable ARQ retransmission
+		if len(u.ptcpSegments) < 64 {
+			u.ptcpSegments = append(u.ptcpSegments, &ptcpSegment{
+				seq:    ptcp.Rlid,
+				endSeq: u.ptcpSent,
+				raw:    raw,
+				sentAt: time.Now(),
+			})
+		}
 	}
 
-	u.Send(ptcp.Bytes())
+	u.Send(raw)
+}
+
+// CheckRetransmit inspects unacknowledged in-flight PTCP data frames and
+// resends any frame whose RTO deadline has expired (Dahua CPhonyTcp retransAckSegment parity).
+func (u *UDP) CheckRetransmit() int {
+	u.ptcpMu.Lock()
+	defer u.ptcpMu.Unlock()
+	if len(u.ptcpSegments) == 0 {
+		return 0
+	}
+	now := time.Now()
+	retransmitted := 0
+	for _, seg := range u.ptcpSegments {
+		if now.Sub(seg.sentAt) >= 300*time.Millisecond && seg.retries < 5 {
+			seg.retries++
+			seg.sentAt = now
+			u.Send(seg.raw)
+			retransmitted++
+		}
+	}
+	return retransmitted
 }
 
 func GetInvertedBytes(data []byte) []byte {

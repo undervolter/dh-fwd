@@ -1725,7 +1725,7 @@ func (t *Tunnel) serve() error {
 // readLoopIdleTimeout — потолок одного ReadPTCP в readLoop. Var, чтобы
 // тесты могли сжимать (реальная смерть детектится по LastRecv, не по
 // гранулярности этого чтения — но тесты ждут развязку быстрее 5с).
-var readLoopIdleTimeout = 5 * time.Second
+var readLoopIdleTimeout = 250 * time.Millisecond
 
 // readLoop consumes PTCP frames from one socket. done is the generation
 // token captured at spawn: after a reset this goroutine must exit silently.
@@ -1741,6 +1741,7 @@ func (t *Tunnel) readLoop(done chan struct{}, u *UDP) {
 		p, err := u.ReadPTCP(readLoopIdleTimeout)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				u.CheckRetransmit()
 				if u == t.getPrimary() {
 					silent := time.Since(u.LastRecv())
 					// Continuous silence past the give-up horizon: the
@@ -1881,7 +1882,8 @@ func (t *Tunnel) heartbeatLoop(done chan struct{}) {
 				mr.RequestPTCP([]byte{})
 			}
 			if p != nil {
-				p.RequestPTCP(ptcpHeartbeat)
+				p.CheckRetransmit()
+				p.RequestPTCP(nil)
 			}
 
 			now := time.Now()
@@ -2367,9 +2369,9 @@ func (t *Tunnel) tryRePunch() {
 	if t.rePunchPub != nil {
 		p.SendTo(t.rePunchPacket, t.rePunchPub)
 	}
-	// One PTCP SYNC on top: app-dialect devices answer the SYNC, classic
-	// ones answer the punch.
-	p.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+	// Pure ACK frame to refresh NAT and trigger peer ACK without corrupting stream seq
+	p.CheckRetransmit()
+	p.RequestPTCP(nil)
 }
 
 func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error)) {
