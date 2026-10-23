@@ -29,8 +29,7 @@ Software for creating tunnels to a Dahua camera (by serial number), forwarding a
 > Also, Dahua may reject requests if you have a time desync.
 
 > [!IMPORTANT]
-> The tunnel won't build if you're using VPN or proxy!
-> If the connection to the camera goes through an intermediate server, the web panel might not work! Unfortunately, this is specifically a problem on Dahua's server side, so there's nothing to be done about it.
+> If the connection to the camera goes through an intermediate server, the web panel might not work! This is dh-fwd's issue that will be fixed (hopefully) at 0.2
 
 ## Build
 
@@ -109,7 +108,7 @@ Local ports are bound to `127.0.0.1` (`localhost`).
 ./dh-fwd SN -p 1337:80
 ```
 ```text
-[23:54] dh-fwd v2.4.1 (latest)
+[23:54] dh-fwd 0.1 (latest)
 Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on :1337
 ```
 
@@ -121,7 +120,7 @@ Connecting to 4C04441PAG726F6:80 [=======================>] 100 % | Listening on
 ```
 
 ```text
-[23:59] dh-fwd v2.4.1 (latest)
+[23:59] dh-fwd 0.1 (latest)
 Connecting to 4C04441PAG726F6:80,81 [=======================>] 100 % | Listening on :5080, 5081
 ```
 
