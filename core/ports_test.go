@@ -239,3 +239,59 @@ func TestSpecPortOverride(t *testing.T) {
 		}
 	}
 }
+
+func TestPTCPReliableARQ(t *testing.T) {
+	rxConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Skipf("udp listen: %v", err)
+	}
+	defer rxConn.Close()
+	port := rxConn.LocalAddr().(*net.UDPAddr).Port
+
+	u := NewUDP("127.0.0.1", port, false, smartpssProfile)
+	defer u.Close()
+
+	// 1. Send data payload -> must be queued in in-flight segments
+	payload := []byte("GET /pageBase.js HTTP/1.1\r\n\r\n")
+	u.RequestPTCP(payload)
+
+	u.ptcpMu.Lock()
+	if len(u.ptcpSegments) != 1 {
+		u.ptcpMu.Unlock()
+		t.Fatalf("in-flight segments = %d, want 1", len(u.ptcpSegments))
+	}
+	seg := u.ptcpSegments[0]
+	endSeq := seg.endSeq
+	u.ptcpMu.Unlock()
+
+	// 2. Simulate RTO: segment older than 300ms must be retransmitted
+	time.Sleep(310 * time.Millisecond)
+	retransmitted := u.CheckRetransmit()
+	if retransmitted != 1 {
+		t.Fatalf("CheckRetransmit = %d, want 1", retransmitted)
+	}
+
+	// 3. Simulate peer ACK acknowledging endSeq
+	ackPkt := &PTCP{
+		Rlid: 0,
+		Llid: endSeq,
+		Pid:  0x0000FFFF,
+		Lmid: 100,
+		Rmid: 1,
+	}
+	rxConn.WriteTo(ackPkt.Bytes(), &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: u.conn.LocalAddr().(*net.UDPAddr).Port})
+
+	// Read ACK
+	_, err = u.ReadPTCP(time.Second)
+	if err != nil {
+		t.Fatalf("ReadPTCP: %v", err)
+	}
+
+	// In-flight segments must be pruned
+	u.ptcpMu.Lock()
+	remaining := len(u.ptcpSegments)
+	u.ptcpMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("remaining in-flight segments = %d, want 0", remaining)
+	}
+}
