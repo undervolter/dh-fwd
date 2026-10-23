@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -51,13 +52,14 @@ var (
 	relayLookupTimeout = 3 * time.Second
 	relayAgentTimeout  = 3 * time.Second
 
-	// First retransmit fires early (700 ms): the agent's ack normally
-	// round-trips in 200-400 ms, so a longer first wait just idles (live
-	// 2026-09-13: three 1.2 s timeouts before the ack landed on the 4th
-	// send). Remaining retries step back up to relayChannelRetransInterval.
-	relayChannelFirstInterval   = 700 * time.Millisecond
-	relayChannelRetransInterval = 1200 * time.Millisecond
-	relayChannelMaxRetransmits  = 3
+	// Dahua SmartPSS parity (CP2PLinkThroughRelay::onBindSuccess / sub_18004DFF0):
+	// 1. Total wait budget: 10,000 ms (10 seconds) (*(_QWORD*)(a1+5584)+10000LL).
+	// 2. Initial interval starts at 1200ms to allow cross-continental cloud <-> camera WAN round-trip.
+	// 3. Retries use exponential backoff (v12 = 2 * v12) up to 2400ms.
+	relayChannelFirstInterval   = 1200 * time.Millisecond
+	relayChannelRetransInterval = 2400 * time.Millisecond
+	relayChannelTotalBudget     = 10000 * time.Millisecond
+	relayChannelMaxRetransmits  = 4
 )
 
 var (
@@ -90,6 +92,7 @@ func isNotFound(reason string) bool {
 }
 
 var ForceAppRelay = false
+var ForceRelay = false
 var errPTCPAppFallback = errors.New("ptcp token spam: app dialect fallback")
 
 var ptcpHeartbeat = []byte{
@@ -1004,6 +1007,54 @@ func (t *Tunnel) establish() error {
 		}
 	}
 
+	// Forced UDP-relay mode (--relay / -r): skip STUN punch entirely
+	if ForceRelay {
+		t.logf("UDP relay forced (--relay) ? skipping direct STUN punch")
+		if !agentOK {
+			return fmt.Errorf("relay agent unavailable but --relay was specified")
+		}
+		t.statusf(PhaseRelayChannel, "relay-channel")
+		authStr := ""
+		if t.dtype > 0 {
+			nonce2 := getNonce()
+			authStr = getAuth(t.username, xchg.req.key, nonce2, "", t.randsalt)
+		}
+		if err := t.waitRelayChannelAck(mainRemote, agentHost, agentPort, authStr); err != nil {
+			return fmt.Errorf("relay-channel ack: %w", err)
+		}
+		t.statusf(PhaseNATPunch, "PTCP sync")
+		mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+		t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+		p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
+		if err != nil {
+			return fmt.Errorf("relay ptcp sync: %w", err)
+		}
+		mainRemote.RequestPTCP(nil)
+		if !t.profile.noRelayAuth && !t.forceAppRelay && !ForceAppRelay {
+			t.statusf(PhaseNATPunch, "PTCP token")
+			mainRemote.RequestPTCP([]byte{
+				0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				0x00, 0x00, 0x00, 0x00,
+			})
+			t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
+			p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
+			if err != nil {
+				if errors.Is(err, errPTCPAppFallback) {
+					t.forceAppRelay = true
+					t.logf("ptcp 0x17: token not supported by relay (heartbeat spam), switching to app relay dialect")
+				} else {
+					return fmt.Errorf("relay ptcp 0x17: %w", err)
+				}
+			} else {
+				_ = p.Body
+				mainRemote.RequestPTCP(nil)
+			}
+		}
+		t.statusf(PhasePTCPHandshake, "relay path")
+		t.setPrimary(mainRemote)
+		return nil
+	}
+
 	// =========================================================================
 	// PARALLEL RACE: Relay Channel setup vs Direct STUN Punch
 	// =========================================================================
@@ -1249,16 +1300,20 @@ func (t *Tunnel) establish() error {
 			}
 		case <-activeRelayChan:
 			if relayErr == nil && agentOK {
-				t.logf("Relay channel ready (fast path) — opening tunnel immediately!")
+				t.logf("Relay channel ready (fast path) - opening tunnel immediately on relay!")
 				t.statusf(PhasePTCPHandshake, "relay path")
 				setPrimaryRelay := func(u *UDP) { t.setPrimary(u) }
 				setPrimaryRelay(mainRemote)
 
-				// In background: continue STUN punch and upgrade to Direct P2P before first client connects
-				go t.backgroundSTUNUpgrade(deviceRemote, stunChan, activateDirect)
+				// Relay won the race: stay on reliable Relay path.
+				// Background STUN can finish without hijacking tunnel away from relay.
+				go func() {
+					if res, ok := <-stunChan; ok && len(res.data) > 0 {
+						t.logf("Background STUN punch also succeeded (peer reachable directly)")
+					}
+				}()
 				return nil
 			}
-			// Relay failed: disable relay channel in select so we keep waiting for STUN
 			activeRelayChan = nil
 			if stunChan == nil {
 				goto doneWaiting
@@ -1280,24 +1335,6 @@ doneWaiting:
 	return fmt.Errorf("STUN punch failed and relay unavailable (%v)", relayErr)
 }
 
-func (t *Tunnel) backgroundSTUNUpgrade(deviceRemote *UDP, stunChan <-chan stunResult, activateDirect func()) {
-	res, ok := <-stunChan
-	if !ok || len(res.data) == 0 {
-		t.logf("Background STUN punch completed: peer not reachable directly, maintaining relay path")
-		return
-	}
-	t.logf("Background STUN punch succeeded! Checking if tunnel can upgrade to direct P2P...")
-	t.clientsMu.Lock()
-	defer t.clientsMu.Unlock()
-	// Upgrade only if no active client data streams are currently flowing through relay
-	if len(t.clients) == 0 {
-		activateDirect()
-		t.logf("[+] Upgraded to direct P2P path before first client connection!")
-		fmt.Println("\r\033[32m[+]\033[0m Upgraded to direct P2P path!")
-	} else {
-		t.logf("[i] Direct P2P punched, active clients on relay — maintaining stable relay stream")
-	}
-}
 
 // attachTCPRelay dials the relay agent over TCP and installs the TOU
 // channel as the active data path (docs/REVERSE.md §14-16).
@@ -1412,34 +1449,72 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 	}
 
 	sendRelayChannel()
-	t.logf("waiting for relay-channel ack from agent %s:%d (interval %v, max %d retries)",
-		agentHost, agentPort, interval, relayChannelMaxRetransmits)
+	t.logf("waiting for relay-channel ack from agent %s:%d (interval %v, max %d retries, total budget %v)",
+		agentHost, agentPort, interval, relayChannelMaxRetransmits, relayChannelTotalBudget)
 
+	startWait := time.Now()
 	var lastErr error
+
 	for attempt := 0; attempt <= relayChannelMaxRetransmits; attempt++ {
-		res, err := mainRemote.Read(true, interval)
-		if err == nil {
-			if t.debug {
-				t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
+		readDeadline := time.Now().Add(interval)
+		var res *DHResponse
+		var err error
+
+		for time.Now().Before(readDeadline) {
+			rem := time.Until(readDeadline)
+			if rem <= 0 {
+				err = context.DeadlineExceeded
+				break
 			}
-			if v := res.Body["body/version"]; isPeerSupportLinkSwitch(v) {
-				t.forceAppRelay = true
-				if t.poolExplicit {
-					t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
-				} else {
-					t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
-					t.poolTarget = 0
+			res, err = mainRemote.Read(true, rem)
+			if err != nil {
+				break
+			}
+			// Dahua sub_180049B20 parity: if (v5 == 100) return 1;
+			// 100 Trying: cloud dispatched request to camera, wait for 200 OK
+			if res.Code == 100 {
+				if t.debug {
+					t.logf("relay-channel: cloud responded 100 Trying, awaiting 200 OK...")
 				}
+				continue
 			}
-			return nil
+			// 200 OK: peer connected to relay channel
+			if res.Code == 200 {
+				if t.debug {
+					t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
+				}
+				if v := res.Body["body/version"]; isPeerSupportLinkSwitch(v) {
+					t.forceAppRelay = true
+					if t.poolExplicit {
+						t.logf("device version %s (2024+) detected - enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
+					} else {
+						t.logf("device version %s (2024+) detected - disabling realm pool and enabling app relay dialect", v)
+						t.poolTarget = 0
+					}
+				}
+				return nil
+			}
+			// Error responses (401, 403, 404, etc.)
+			if res.Code >= 400 {
+				return fmt.Errorf("relay-channel rejected (code %d: %s)", res.Code, res.Status)
+			}
 		}
+
 		lastErr = err
+		if time.Since(startWait) >= relayChannelTotalBudget {
+			return fmt.Errorf("relay-channel wait peer timeout (exceeded %v): %w", relayChannelTotalBudget, lastErr)
+		}
+
 		if attempt < relayChannelMaxRetransmits {
-			t.logf("relay-channel ack timed out (%v) — retransmitting %d/%d", err, attempt+1, relayChannelMaxRetransmits)
+			t.logf("relay-channel ack timed out (%v) - retransmitting %d/%d (next interval %v)",
+				lastErr, attempt+1, relayChannelMaxRetransmits, interval)
 			t.statusf(PhaseRelayChannel, fmt.Sprintf("relay-channel retry %d/%d", attempt+1, relayChannelMaxRetransmits))
 			sendRelayChannel()
-			// After the early first probe, back off to the full interval.
-			interval = relayChannelRetransInterval
+			// SmartPSS exponential backoff (v12 = 2 * v12)
+			interval = interval * 2
+			if interval > relayChannelRetransInterval {
+				interval = relayChannelRetransInterval
+			}
 		}
 	}
 	return fmt.Errorf("relay-channel read: %w", lastErr)

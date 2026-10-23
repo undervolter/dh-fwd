@@ -235,6 +235,8 @@ func Execute() {
 	flag.DurationVar(&hbTimeout, "hb", 30*time.Second, "PTCP heartbeat timeout")
 	flag.BoolVar(&ForceAppRelay, "app-relay", false, "force app relay dialect (skips 0x17/0x19 token auth, for 2024+ devices and modern relays)")
 	flag.BoolVar(&ForceAppRelay, "ar", false, "force app relay dialect")
+	flag.BoolVar(&ForceRelay, "relay", false, "force UDP relay data path (skips direct STUN punch)")
+	flag.BoolVar(&ForceRelay, "r", false, "force UDP relay data path")
 	flag.StringVar(&appName, "app", "smartpss", "application profile: smartpss (default) or dmss — picks the cloud host, app credentials and request dialect (dmss for devices bound via the DMSS app)")
 	var autoYes bool
 	flag.BoolVar(&autoYes, "y", false, "skip confirmation prompts")
@@ -375,6 +377,7 @@ General:
                                   Dahua cloud and print diagnostics
   --app-relay, -ar                force app relay dialect (skips 0x17/0x19
                                   token auth on modern devices / relays)
+  --relay, -r                     force the UDP-relay data path (skip STUN punch)
   --race                          race application profiles (smartpss vs dmss)
                                   in parallel for fastest connection
   --tcp-relay, -R                 force the TCP-relay data path (TOU over TCP)
