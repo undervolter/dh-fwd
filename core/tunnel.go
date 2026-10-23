@@ -735,6 +735,11 @@ func (t *Tunnel) waitForPTCPToken(u *UDP, timeout time.Duration) (*PTCP, error) 
 // allocation, Server Nat Info, inverted STUN punch and PTCP negotiation.
 // On STUN success t.primary = deviceRemote (direct), otherwise mainRemote
 // (relay agent).
+type stunResult struct {
+	data []byte
+	addr *net.UDPAddr
+}
+
 func (t *Tunnel) establish() error {
 	mainRemote := NewUDP(t.profile.mainServer, t.profile.mainPort, t.debug, t.profile)
 	t.segmentMax = resolveSegmentMax(t.profile.mainServer, t.userMTU, false, t.logf)
@@ -1113,145 +1118,185 @@ func (t *Tunnel) establish() error {
 		}
 	}
 
-	sendBurst()
+	stunChan := make(chan stunResult, 1)
 
-	var stunResponse []byte
-	deviceRemote.SetTimeout(300 * time.Millisecond)
-	deadline := time.Now().Add(4 * time.Second)
-	attempt := 0
-	maxAttempts := 10
+	// Launch STUN punch loop in background
+	go func() {
+		defer close(stunChan)
+		sendBurst()
+		deadline := time.Now().Add(3 * time.Second)
+		attempt := 0
+		maxAttempts := 8
 
-	for time.Now().Before(deadline) {
-		deviceRemote.SetTimeout(300 * time.Millisecond)
-		data, addr, err := deviceRemote.RecvFrom(4096)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				attempt++
-				if attempt < maxAttempts {
-					t.logf("Retransmit STUN init (attempt %d/%d)", attempt, maxAttempts)
-					sendBurst()
-					continue
+		for time.Now().Before(deadline) {
+			deviceRemote.SetTimeout(250 * time.Millisecond)
+			data, addr, err := deviceRemote.RecvFrom(4096)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					attempt++
+					if attempt < maxAttempts {
+						t.logf("Retransmit STUN init (attempt %d/%d)", attempt, maxAttempts)
+						sendBurst()
+						continue
+					}
+					break
 				}
 				break
 			}
-			break
-		}
-		if len(data) < 20 {
-			t.logf("STUN <<< short datagram (%d bytes) - ignored", len(data))
-			continue
-		}
+			if len(data) < 20 {
+				continue
+			}
 
-		magic := data[:4]
-		t.logf("STUN <<< %s magic=%x len=%d", addr, magic, len(data))
-
-		// Dahua STUN Binding Success Response: 0x0101 XOR 0xFFFF = 0xFEFE
-		if data[0] == 0xFE && data[1] == 0xFE {
-			stunResponse = data
-			t.logf("Got STUN response (magic=%02x%02x len=%d from %s)", data[0], data[1], len(data), addr)
-			if addr != nil {
-				deviceRemote.SetRemote(addr.IP.String(), addr.Port)
-				devParts[0] = addr.IP.String()
-				devPort = addr.Port
-				devParts[1] = strconv.Itoa(devPort)
-				t.logf("STUN: locked deviceRemote endpoint to %s:%d", devParts[0], devPort)
-			}
-			break
-		} else if data[0] == 0xFF && data[1] == 0xFE {
-			// Dahua STUN Binding Request from device: 0x0001 XOR 0xFFFF = 0xFFFE
-			t.logf("Got device cross-STUN init (magic=%02x%02x from %s), responding...", data[0], data[1], addr)
-			if addr != nil {
-				deviceRemote.SetRemote(addr.IP.String(), addr.Port)
-				devParts[0] = addr.IP.String()
-				devPort = addr.Port
-				devParts[1] = strconv.Itoa(devPort)
-				t.logf("STUN: locked deviceRemote endpoint to %s:%d", devParts[0], devPort)
-			}
-			resp := make([]byte, 0, 40)
-			resp = append(resp, []byte{0xFE, 0xFE, 0xFF, 0xE7}...)
-			if len(data) >= 8 {
-				resp = append(resp, data[4:8]...)
-			} else {
-				resp = append(resp, cookie...)
-			}
-			if len(data) >= 20 {
-				resp = append(resp, data[8:20]...)
-			} else {
-				resp = append(resp, transID...)
-			}
-			resp = append(resp, []byte{0x7F, 0xD6, 0xFF, 0xF7}...)
-			resp = append(resp, invAid...)
-			if len(data) >= 40 {
-				resp = append(resp, []byte{0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE}...)
-				resp = append(resp, data[34:40]...)
-			}
-			for range 3 {
-				deviceRemote.SendTo(resp, addr)
-			}
-			t.logf("STUN >>> %s response sent (x3)", addr)
-			stunResponse = data
-			break
-		} else {
-			t.logf("Unknown STUN magic: %x", magic)
-		}
-	}
-
-	if stunResponse == nil {
-		// STUN punch failed or timed out: fall back to Relay
-		<-relayDone
-		if relayErr != nil || !agentOK {
-			if tcpRelayAllowed {
-				t.logf("STUN and UDP relay failed (%v) — policy allows tcprelay, trying TCP relay", relayErr)
-				t.statusf(PhasePTCPHandshake, "TCP relay fallback")
-				if aerr := t.attachTCPRelay(agentHost, agentPort, agentToken); aerr == nil {
-					t.logf("TCP relay channel attached (fallback)")
-					return nil
+			if data[0] == 0xFE && data[1] == 0xFE {
+				t.logf("Got STUN response (magic=%02x%02x len=%d from %s)", data[0], data[1], len(data), addr)
+				if addr != nil {
+					deviceRemote.SetRemote(addr.IP.String(), addr.Port)
+					devParts[0] = addr.IP.String()
+					devPort = addr.Port
+					devParts[1] = strconv.Itoa(devPort)
+					t.logf("STUN: locked deviceRemote endpoint to %s:%d", devParts[0], devPort)
 				}
+				stunChan <- stunResult{data: data, addr: addr}
+				return
+			} else if data[0] == 0xFF && data[1] == 0xFE {
+				t.logf("Got device cross-STUN init (magic=%02x%02x from %s), responding...", data[0], data[1], addr)
+				if addr != nil {
+					deviceRemote.SetRemote(addr.IP.String(), addr.Port)
+					devParts[0] = addr.IP.String()
+					devPort = addr.Port
+					devParts[1] = strconv.Itoa(devPort)
+					t.logf("STUN: locked deviceRemote endpoint to %s:%d", devParts[0], devPort)
+				}
+				resp := make([]byte, 0, 40)
+				resp = append(resp, []byte{0xFE, 0xFE, 0xFF, 0xE7}...)
+				if len(data) >= 8 {
+					resp = append(resp, data[4:8]...)
+				} else {
+					resp = append(resp, cookie...)
+				}
+				if len(data) >= 20 {
+					resp = append(resp, data[8:20]...)
+				} else {
+					resp = append(resp, transID...)
+				}
+				resp = append(resp, []byte{0x7F, 0xD6, 0xFF, 0xF7}...)
+				resp = append(resp, invAid...)
+				if len(data) >= 40 {
+					resp = append(resp, []byte{0xFF, 0xFB, 0xFF, 0xF7, 0xFF, 0xFE}...)
+					resp = append(resp, data[34:40]...)
+				}
+				for range 3 {
+					deviceRemote.SendTo(resp, addr)
+				}
+				stunChan <- stunResult{data: data, addr: addr}
+				return
 			}
-			return fmt.Errorf("STUN punch failed and relay unavailable (%v)", relayErr)
 		}
-		t.logf("STUN failed — using relay agent as the data path")
-		t.statusf(PhasePTCPHandshake, "relay path")
-		setPrimaryRelay := func(u *UDP) { t.setPrimary(u) }
-		setPrimaryRelay(mainRemote)
-		return nil
-	}
+	}()
 
-	// STUN punch succeeded! Confirm direct channel with 5 Binding Confirms
-	t.statusf(PhasePTCPHandshake, "PTCP handshake")
 	confirm := []byte{0xFE, 0xFE, 0xFF, 0xF3}
 	confirm = append(confirm, cookie...)
 	confirm = append(confirm, transID...)
 	confirm = append(confirm, []byte{0x7F, 0xD6, 0xFF, 0xF7}...)
 	confirm = append(confirm, invAid...)
 
-	for range 5 {
-		t.logf("Confirm >>>")
-		deviceRemote.Send(confirm)
-	}
-
-	time.Sleep(200 * time.Millisecond)
-	deviceRemote.SetTimeout(300 * time.Millisecond)
-	for {
-		data, addr, err := deviceRemote.RecvFrom(4096)
-		if err != nil {
-			break
+	activateDirect := func() {
+		t.statusf(PhasePTCPHandshake, "PTCP handshake")
+		for range 5 {
+			t.logf("Confirm >>>")
+			deviceRemote.Send(confirm)
 		}
-		t.logf("Drain <<< %s magic=%x len=%d", addr, data[:4], len(data))
+		time.Sleep(100 * time.Millisecond)
+		deviceRemote.SetTimeout(200 * time.Millisecond)
+		for {
+			data, addr, err := deviceRemote.RecvFrom(4096)
+			if err != nil {
+				break
+			}
+			t.logf("Drain <<< %s magic=%x len=%d", addr, data[:4], len(data))
+		}
+		deviceRemote.SetTimeout(0)
+		t.logf("direct data path: SYNC only, no link-switch 0x17/0x19 (pure P2P)")
+		deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+		if _, err := deviceRemote.ReadPTCP(2 * time.Second); err != nil {
+			t.logf("direct ptcp sync: %v (continuing on punched channel)", err)
+		}
+		t.statusf(PhasePTCPHandshake, "direct path")
+		t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
+		t.setPrimary(deviceRemote)
 	}
-	deviceRemote.SetTimeout(0)
 
-	// Direct P2P data path: STUN punch succeeded!
-	// Fresh P2P channels NEVER need link-switch pause/resume (0x17/0x19).
-	// We only do PTCP SYNC, establish direct path, and start streaming immediately.
-	t.logf("direct data path: SYNC only, no link-switch 0x17/0x19 (pure P2P)")
-	deviceRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
-	if _, err := deviceRemote.ReadPTCP(3 * time.Second); err != nil {
-		t.logf("direct ptcp sync: %v (continuing on punched channel)", err)
+	// FAST PATH RACE:
+	// If Relay completes first, immediately bring up the tunnel on Relay!
+	// If STUN completes first (LAN/low-latency direct link), use Direct P2P!
+	var activeRelayChan <-chan struct{}
+	if agentOK {
+		activeRelayChan = relayDone
 	}
-	t.statusf(PhasePTCPHandshake, "direct path")
-	t.storeRePunch(stunInit, localIPStr, localPortVal, devParts)
-	t.setPrimary(deviceRemote)
-	return nil
+
+	for {
+		select {
+		case res, ok := <-stunChan:
+			if ok && len(res.data) > 0 {
+				t.logf("Direct STUN punch succeeded!")
+				activateDirect()
+				return nil
+			}
+			// STUN failed: if relay is also done/failed, break out to TCP relay fallback
+			stunChan = nil
+			if activeRelayChan == nil {
+				goto doneWaiting
+			}
+		case <-activeRelayChan:
+			if relayErr == nil && agentOK {
+				t.logf("Relay channel ready (fast path) — opening tunnel immediately!")
+				t.statusf(PhasePTCPHandshake, "relay path")
+				setPrimaryRelay := func(u *UDP) { t.setPrimary(u) }
+				setPrimaryRelay(mainRemote)
+
+				// In background: continue STUN punch and upgrade to Direct P2P before first client connects
+				go t.backgroundSTUNUpgrade(deviceRemote, stunChan, activateDirect)
+				return nil
+			}
+			// Relay failed: disable relay channel in select so we keep waiting for STUN
+			activeRelayChan = nil
+			if stunChan == nil {
+				goto doneWaiting
+			}
+		}
+	}
+
+doneWaiting:
+
+	// Both UDP paths failed — try TCP relay fallback
+	if tcpRelayAllowed {
+		t.logf("STUN and UDP relay failed (%v) — policy allows tcprelay, trying TCP relay", relayErr)
+		t.statusf(PhasePTCPHandshake, "TCP relay fallback")
+		if aerr := t.attachTCPRelay(agentHost, agentPort, agentToken); aerr == nil {
+			t.logf("TCP relay channel attached (fallback)")
+			return nil
+		}
+	}
+	return fmt.Errorf("STUN punch failed and relay unavailable (%v)", relayErr)
+}
+
+func (t *Tunnel) backgroundSTUNUpgrade(deviceRemote *UDP, stunChan <-chan stunResult, activateDirect func()) {
+	res, ok := <-stunChan
+	if !ok || len(res.data) == 0 {
+		t.logf("Background STUN punch completed: peer not reachable directly, maintaining relay path")
+		return
+	}
+	t.logf("Background STUN punch succeeded! Checking if tunnel can upgrade to direct P2P...")
+	t.clientsMu.Lock()
+	defer t.clientsMu.Unlock()
+	// Upgrade only if no active client data streams are currently flowing through relay
+	if len(t.clients) == 0 {
+		activateDirect()
+		t.logf("[+] Upgraded to direct P2P path before first client connection!")
+		fmt.Println("\r\033[32m[+]\033[0m Upgraded to direct P2P path!")
+	} else {
+		t.logf("[i] Direct P2P punched, active clients on relay — maintaining stable relay stream")
+	}
 }
 
 // attachTCPRelay dials the relay agent over TCP and installs the TOU
