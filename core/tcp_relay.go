@@ -51,7 +51,7 @@ type touChannel struct {
 // dialTCPRelay performs the full agent attach:
 // TCP connect → <profile post verb> /tcprelay/client-bind {"Token":...} →
 // SYN → wait ACK.
-func dialTCPRelay(prof *appProfile, agentHost string, agentPort int, token string, debug bool, logf func(string, ...any)) (*touChannel, error) {
+func dialTCPRelay(prof *appProfile, agentHost string, agentPort int, token string, debug bool, logf func(string, ...any), remotePort ...uint16) (*touChannel, error) {
 	addr := net.JoinHostPort(agentHost, strconv.Itoa(agentPort))
 	logf("tcp-relay: dialing agent %s", addr)
 	conn, err := net.DialTimeout("tcp", addr, tcpRelayDialTimeout)
@@ -86,7 +86,11 @@ func dialTCPRelay(prof *appProfile, agentHost string, agentPort int, token strin
 
 	// (A2) SYN with a random local session; expect an ACK back.
 	ch.localSession = rand.Uint32()
-	syn := touBuildSyn(ch.localSession)
+	var rport uint16
+	if len(remotePort) > 0 {
+		rport = remotePort[0]
+	}
+	syn := touBuildSyn(ch.localSession, rport)
 	logf("tcp-relay: >>> SYN session=%#010x", ch.localSession)
 	if _, err := conn.Write(syn); err != nil {
 		conn.Close()

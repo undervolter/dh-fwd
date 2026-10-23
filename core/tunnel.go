@@ -923,7 +923,7 @@ func (t *Tunnel) establish() error {
 		return fmt.Errorf("device response: code=%d %s", res.Code, res.Status)
 	}
 
-	if v := res.Body["body/version"]; strings.HasPrefix(v, "5.") || strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") || strings.HasPrefix(v, "8.") {
+	if v := res.Body["body/version"]; isPeerSupportLinkSwitch(v) {
 		t.forceAppRelay = true
 		if t.poolExplicit {
 			t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
@@ -1255,7 +1255,11 @@ func (t *Tunnel) establish() error {
 // attachTCPRelay dials the relay agent over TCP and installs the TOU
 // channel as the active data path (docs/REVERSE.md §14-16).
 func (t *Tunnel) attachTCPRelay(agentHost string, agentPort int, token string) error {
-	ch, err := dialTCPRelay(t.profile, agentHost, agentPort, token, t.debug, t.logf)
+	var rport uint16 = 80
+	if len(t.specs) > 0 && t.specs[0].Remote > 0 {
+		rport = uint16(t.specs[0].Remote)
+	}
+	ch, err := dialTCPRelay(t.profile, agentHost, agentPort, token, t.debug, t.logf, rport)
 	if err != nil {
 		return err
 	}
@@ -1371,7 +1375,7 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 			if t.debug {
 				t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
 			}
-			if v := res.Body["body/version"]; strings.HasPrefix(v, "5.") || strings.HasPrefix(v, "6.") || strings.HasPrefix(v, "7.") || strings.HasPrefix(v, "8.") {
+			if v := res.Body["body/version"]; isPeerSupportLinkSwitch(v) {
 				t.forceAppRelay = true
 				if t.poolExplicit {
 					t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)

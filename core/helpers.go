@@ -782,3 +782,17 @@ func GetInvertedBytes(data []byte) []byte {
 	}
 	return out
 }
+
+// isPeerSupportLinkSwitch mirrors Dahua P2PDll.dll isPeerSupportLinkSwitchAndLocalP2P (0x18001D540):
+// verifies whether the peer's major P2P version is >= 5.
+func isPeerSupportLinkSwitch(v string) bool {
+	if v == "" {
+		return false
+	}
+	dot := strings.IndexByte(v, '.')
+	if dot <= 0 {
+		return false
+	}
+	major, err := strconv.Atoi(v[:dot])
+	return err == nil && major >= 5
+}
