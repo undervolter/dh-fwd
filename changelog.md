@@ -1,7 +1,10 @@
 [23.10.26] dh-fwd v2.5.0
 - PTCP Transport Upgrade: dynamic Jacobson/Karn RTO calculation (SRTT + 4*RTTVAR) matching Dahua P2PDll.dll CPhonyTcp::processSender
 - Inbound in-order reassembly queue (matching CPhonyTcp::processReceiver): eliminate stream corruption from out-of-order UDP packets
-- Fast-Path Startup: bring up Relay path in ~300ms flat, punch STUN concurrently in background with zero startup stall\n- Port 80 Web Concurrency Throttle: max 3 concurrent active realms to protect embedded dvrweb from socket exhaustion (DVR DISC)
+- SmartPSS Relay Parity (sub_18004DFF0 / sub_180049B20): 10s peer wait budget, 1200ms initial RTO with exponential backoff, proper 100 Trying handling
+- Relay Resilience: added --relay (-r) flag to force dedicated UDP relay path (skip STUN punch on cross-continental high-latency links)
+- Fast-Path Startup: race Relay vs STUN, instantly open whichever connects first without hijacking active relay sessions
+- Port 80 Web Concurrency Throttle: max 3 concurrent active realms to protect embedded dvrweb from socket exhaustion (DVR DISC)
 - Strict cumulative ACK sequence tracking and exponential backoff on retries
 
 [3.10.26] dh-fwd v2.4.1
