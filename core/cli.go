@@ -242,6 +242,8 @@ func Execute() {
 	flag.BoolVar(&autoYes, "y", false, "skip confirmation prompts")
 	flag.BoolVar(&autoYes, "yes", false, "skip confirmation prompts")
 	flag.BoolVar(&raceMode, "race", false, "parallel race application profiles (smartpss vs dmss) and direct STUN vs relay")
+	flag.BoolVar(&AutoReconnect, "reconnect", false, "persistently reconnect on network drops or connection loss")
+	flag.BoolVar(&AutoReconnect, "rc", false, "persistently reconnect on network drops")
 	flag.Usage = usage
 
 	positional, err := parseArgs(flag.CommandLine, os.Args[1:])
@@ -696,17 +698,13 @@ func runSingleRace(serial string, profiles []*appProfile, spec PortSpec, dtype i
 
 	writeLog("Profile %s WON the race! Serving port :%d -> :%d", winnerProf.displayName(), spec.Local, spec.Remote)
 	if err := winner.serve(); err != nil {
-		if errors.Is(err, errZombieRelay) {
-			writeLog("zombie relay detected — recovering with app relay dialect")
-			winner.reset()
-			runWithRetries(winner, cp, func(err error) {
-				fmt.Fprintf(os.Stderr, "Tunnel failed: %v\n", err)
-				os.Exit(1)
-			})
-			return
-		}
-		fmt.Fprintf(os.Stderr, "Tunnel serve error: %v\n", err)
-		os.Exit(1)
+		writeLog("winner tunnel serve finished (%v) — starting reconnect loop", err)
+		winner.reset()
+		runWithRetries(winner, cp, func(err error) {
+			fmt.Fprintf(os.Stderr, "Tunnel failed: %v\n", err)
+			os.Exit(1)
+		})
+		return
 	}
 }
 

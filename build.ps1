@@ -18,13 +18,19 @@ $Root = $PSScriptRoot
 if (-not $Root) { $Root = (Get-Location).Path }
 
 if (-not $Version) {
-    if (Test-Path "$Root\updater.go") {
-        $m = Select-String -Path "$Root\updater.go" -Pattern 'var Version\s*=\s*"([^"]+)"'
+    if (Test-Path "$Root\core\updater.go") {
+        $m = Select-String -Path "$Root\core\updater.go" -Pattern 'var Version\s*=\s*"([^"]+)"'
         if ($m.Matches.Groups.Count -gt 1) {
             $Version = $m.Matches.Groups[1].Value
         }
     }
-    if (-not $Version) { $Version = "v2.4.1" }
+    if (-not $Version -and (Test-Path "$Root\main.go")) {
+        $m = Select-String -Path "$Root\main.go" -Pattern 'var Version\s*=\s*"([^"]+)"'
+        if ($m.Matches.Groups.Count -gt 1) {
+            $Version = $m.Matches.Groups[1].Value
+        }
+    }
+    if (-not $Version) { $Version = "0.1" }
 }
 
 New-Item -ItemType Directory -Force -Path "$Root\$OutDir" | Out-Null

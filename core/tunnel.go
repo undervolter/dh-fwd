@@ -93,6 +93,24 @@ func isNotFound(reason string) bool {
 
 var ForceAppRelay = false
 var ForceRelay = false
+var AutoReconnect = false
+
+// Global data-path traffic counters across all active tunnels and clients.
+var (
+	GlobalBytesUp   uint64
+	GlobalBytesDown uint64
+)
+
+// GetBytesStats returns the cumulative bytes sent (up) and received (down).
+func GetBytesStats() (uint64, uint64) {
+	return atomic.LoadUint64(&GlobalBytesUp), atomic.LoadUint64(&GlobalBytesDown)
+}
+
+// ResetBytesStats resets the global traffic counters.
+func ResetBytesStats() {
+	atomic.StoreUint64(&GlobalBytesUp, 0)
+	atomic.StoreUint64(&GlobalBytesDown, 0)
+}
 var errPTCPAppFallback = errors.New("ptcp token spam: app dialect fallback")
 
 var ptcpHeartbeat = []byte{
@@ -139,6 +157,7 @@ const (
 func (c *Client) writeData(b []byte) {
 	if len(b) > 0 {
 		atomic.AddUint64(&c.dataDown, uint64(len(b)))
+		atomic.AddUint64(&GlobalBytesDown, uint64(len(b)))
 	}
 	c.flushMu.Lock()
 	c.pending = append(c.pending, b...)
@@ -287,6 +306,7 @@ type Tunnel struct {
 	// 2024+ forceAppRelay). The operator asked for it — honor it, even if
 	// pre-bound realms may go stale device-side on those dialects.
 	poolExplicit bool
+	hasServed    bool
 
 	// Wire-safe MTU and PTCP segment sizing (auto-detected or forced via --mtu).
 	userMTU    int
@@ -1757,7 +1777,15 @@ func (t *Tunnel) serve() error {
 	}
 	oks := []okListen{}
 	for i, spec := range t.specs {
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", spec.Local))
+		var ln net.Listener
+		var err error
+		for try := 0; try < 5; try++ {
+			ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", spec.Local))
+			if err == nil {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
 		if err != nil {
 			t.logf("listen :%d failed: %v", spec.Local, err)
 			if t.reg != nil {
@@ -1771,6 +1799,7 @@ func (t *Tunnel) serve() error {
 				port = addr.Port
 			}
 		}
+		t.specs[i].Local = port
 		t.listeners = append(t.listeners, ln)
 		oks = append(oks, okListen{idx: t.specIdx[i], port: port, remote: spec.Remote})
 		go t.acceptLoop(ln, spec.Remote)
@@ -1778,6 +1807,7 @@ func (t *Tunnel) serve() error {
 	if len(t.listeners) == 0 {
 		return fmt.Errorf("no listeners available for tunnel")
 	}
+	t.hasServed = true
 
 	for _, o := range oks {
 		if t.reg != nil {
@@ -2377,6 +2407,7 @@ func (t *Tunnel) clientReader(conn net.Conn, realmID uint32) {
 		if c := t.getClient(realmID); c != nil {
 			atomic.AddUint64(&c.dataUp, uint64(n))
 		}
+		atomic.AddUint64(&GlobalBytesUp, uint64(n))
 		t.writeRealmData(realmID, buf[:n])
 	}
 }
@@ -2520,6 +2551,7 @@ func (t *Tunnel) tryRePunch() {
 }
 
 func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error)) {
+	var wasConnected bool
 	for attempt := 1; ; attempt++ {
 		if cp != nil {
 			cp.SetAttempt(attempt)
@@ -2528,20 +2560,21 @@ func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error))
 		attemptStart := time.Now()
 		err := t.Run()
 		if err == nil {
-			// cp.Done() was already called from serve() when listeners came up.
 			return
 		}
 		duration := time.Since(attemptStart)
-		// Terminal errors: retrying cannot change the outcome. 404 — the
-		// device does not exist; listener failure — the local port is
-		// taken (or unbindable), no handshake will ever fix that. Both
-		// used to burn RETRY_ATTEMPTS full cloud handshakes before giving
-		// up (live 2026-09-13: a busy :1337 looped the whole establish
-		// sequence four times for nothing).
+		if t.hasServed || duration > 5*time.Second {
+			wasConnected = true
+		}
+		if duration > 30*time.Second {
+			// Previous session or reconnection was stable: reset backoff counter
+			attempt = 1
+		}
+
 		terminal := errors.Is(err, errDeviceNotFound) ||
 			isAuthError(err) ||
 			strings.Contains(err.Error(), "no listeners available")
-		if terminal {
+		if terminal && !wasConnected && !AutoReconnect {
 			if t.reg != nil {
 				for _, idx := range t.specIdx {
 					t.reg.fail(idx, err.Error())
@@ -2557,6 +2590,30 @@ func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error))
 			}
 			return
 		}
+
+		// Persistent reconnect on network drops or if --reconnect is enabled:
+		if wasConnected || AutoReconnect {
+			delay := time.Duration(attempt) * 2 * time.Second
+			if delay > 10*time.Second {
+				delay = 10 * time.Second
+			}
+			if delay < 2*time.Second {
+				delay = 2 * time.Second
+			}
+			msg := fmt.Sprintf("\033[33m[!]\033[0m Connection lost: %v. Reconnecting in %v (attempt %d)...", err, delay, attempt)
+			writeLog("%s", msg)
+			if cp != nil {
+				cp.Reset(fmt.Sprintf("reconnect #%d (in %v): %v", attempt, delay, err))
+			} else if t.ui != nil {
+				t.ui.Below(msg)
+			} else {
+				fmt.Printf("\r\033[2K%s\n", msg)
+			}
+			time.Sleep(delay)
+			t.reset()
+			continue
+		}
+
 		if attempt > RETRY_ATTEMPTS {
 			if t.reg != nil {
 				for _, idx := range t.specIdx {
@@ -2575,7 +2632,6 @@ func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error))
 		msg := fmt.Sprintf("Tunnel failed after %.1fs, reason - %v, retrying %d/%d", duration.Seconds(), err, attempt, RETRY_ATTEMPTS)
 		writeLog("%s", msg)
 		if cp != nil {
-			// Reset the bar to 0% for the next attempt, keep the error visible briefly.
 			cp.Reset(fmt.Sprintf("retry %d/%d: %s", attempt+1, RETRY_ATTEMPTS, err.Error()))
 		} else if t.ui != nil {
 			t.ui.Below(msg)

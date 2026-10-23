@@ -4,7 +4,7 @@ import (
 	"dh-fwd/core"
 )
 
-var Version = "v2.5.0"
+var Version = "0.1"
 
 func main() {
 	if Version != "" {

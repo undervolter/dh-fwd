@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync/atomic"
 	"time"
 	"fmt"
 	"io"
@@ -221,9 +222,36 @@ func (cp *ConnectProgress) render() {
 	fmt.Fprintf(cp.w, "\r%s", line)
 }
 
-// StartUptimeTracker prints an in-place updating uptime counter on stdout.
+// FormatBytes formats a byte count into a human-readable string (B, KB, MB, GB, TB).
+func FormatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	if exp >= len(units) {
+		exp = len(units) - 1
+	}
+	val := float64(b) / float64(div)
+	if val == float64(uint64(val)) {
+		return fmt.Sprintf("%d %s", uint64(val), units[exp])
+	}
+	return fmt.Sprintf("%.1f %s", val, units[exp])
+}
+
+// StartUptimeTracker prints an in-place updating uptime counter on stdout with traffic statistics.
+var sessionStartTime time.Time
+
 func StartUptimeTracker(done <-chan struct{}) {
-	startTime := time.Now()
+	if sessionStartTime.IsZero() {
+		sessionStartTime = time.Now()
+	}
+	startTime := sessionStartTime
 	ticker := time.NewTicker(1 * time.Second)
 	go func() {
 		defer ticker.Stop()
@@ -240,7 +268,9 @@ func StartUptimeTracker(done <-chan struct{}) {
 				} else {
 					timeStr = fmt.Sprintf("%02d:%02d", m, s)
 				}
-				fmt.Printf("\r\033[2K\033[33m[!]\033[0m Tunnel closed. Total uptime: %s\n", timeStr)
+				up := atomic.LoadUint64(&GlobalBytesUp)
+				down := atomic.LoadUint64(&GlobalBytesDown)
+				fmt.Printf("\r\033[2K\033[33m[!]\033[0m Tunnel closed. Total uptime: %s | ↑ %s ~ ↓ %s\n", timeStr, FormatBytes(up), FormatBytes(down))
 				return
 			case <-ticker.C:
 				elapsed := time.Since(startTime).Round(time.Second)
@@ -253,7 +283,9 @@ func StartUptimeTracker(done <-chan struct{}) {
 				} else {
 					timeStr = fmt.Sprintf("%02d:%02d", m, s)
 				}
-				fmt.Printf("\r\033[36m[*]\033[0m Tunnel uptime: %s", timeStr)
+				up := atomic.LoadUint64(&GlobalBytesUp)
+				down := atomic.LoadUint64(&GlobalBytesDown)
+				fmt.Printf("\r\033[2K\033[36m[*]\033[0m Tunnel uptime: %s | ↑ %s ~ ↓ %s", timeStr, FormatBytes(up), FormatBytes(down))
 			}
 		}
 	}()

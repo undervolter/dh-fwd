@@ -67,6 +67,8 @@ go build .
 | `--heartbeat-timeout` | `-hb` | PTCP heartbeat timeout (default 10s) |
 | `--debug` | `-d` | Debug (logs are in dh-fwd.log) |
 | `--log-retries` | `-lr` | Log retry attempts with timestamps |
+| `--reconnect` | `-rc` | Persistent auto-reconnect on network drops or connection loss |
+| `--yes` | `-y` | Skip confirmation prompts |
 
 `--help` / `-h` prints a list of all available commands.
 

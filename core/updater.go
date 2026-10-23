@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-var Version = "v2.5.0"
+var Version = "0.1"
 
 const (
 	githubRepo    = "undervolter/dh-fwd"
@@ -134,6 +134,14 @@ func targetAssetName() string {
 func isNewerVersion(latest, current string) bool {
 	lParts := parseSemVer(latest)
 	cParts := parseSemVer(current)
+
+	// ZeroVer mapping: local "0.1" corresponds to GitHub release tag v2.5.
+	// If current is 0.1 and upstream GitHub release uses the v2.x tag format,
+	// map current baseline to [2, 5, 0] so older releases (v2.4.x, v2.5) won't trigger false updates.
+	if cParts[0] == 0 && cParts[1] == 1 && lParts[0] == 2 {
+		cParts = [3]int{2, 5, 0}
+	}
+
 	for i := 0; i < 3; i++ {
 		if lParts[i] > cParts[i] {
 			return true

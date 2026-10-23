@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync/atomic"
 	"bufio"
 	"bytes"
 	"encoding/binary"
@@ -134,6 +135,7 @@ func (t *Tunnel) httpAccelHandler(conn net.Conn) httpAccelResult {
 	)
 	conn.Write([]byte(resp))
 	conn.Write(body)
+	atomic.AddUint64(&GlobalBytesDown, uint64(len(resp)+len(body)))
 	conn.Close()
 
 	t.logf("accel: %s delivered %d bytes to browser", path, len(body))

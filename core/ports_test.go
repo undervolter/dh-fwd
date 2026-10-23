@@ -1,6 +1,7 @@
 package core
 
 import (
+	"sync/atomic"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
@@ -364,5 +365,76 @@ func TestPTCPInOrderReassembly(t *testing.T) {
 	u.ptcpMu.Unlock()
 	if recved != len1+len2 {
 		t.Fatalf("ptcpRecv = %d, want %d", recved, len1+len2)
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		bytes uint64
+		want  string
+	}{
+		{0, "0 B"},
+		{500, "500 B"},
+		{1023, "1023 B"},
+		{1024, "1 KB"},
+		{1536, "1.5 KB"},
+		{1048576, "1 MB"},
+		{1572864, "1.5 MB"},
+		{1073741824, "1 GB"},
+		{2684354560, "2.5 GB"},
+	}
+
+	for _, tt := range tests {
+		got := FormatBytes(tt.bytes)
+		if got != tt.want {
+			t.Errorf("FormatBytes(%d) = %q, want %q", tt.bytes, got, tt.want)
+		}
+	}
+}
+
+func TestTrafficStatsCounters(t *testing.T) {
+	ResetBytesStats()
+	up, down := GetBytesStats()
+	if up != 0 || down != 0 {
+		t.Fatalf("initial stats: got up=%d down=%d, want 0, 0", up, down)
+	}
+
+	atomic.AddUint64(&GlobalBytesUp, 1500)
+	atomic.AddUint64(&GlobalBytesDown, 3000)
+
+	up, down = GetBytesStats()
+	if up != 1500 || down != 3000 {
+		t.Fatalf("after add: got up=%d down=%d, want 1500, 3000", up, down)
+	}
+
+	ResetBytesStats()
+	up, down = GetBytesStats()
+	if up != 0 || down != 0 {
+		t.Fatalf("after reset: got up=%d down=%d, want 0, 0", up, down)
+	}
+}
+
+func TestIsNewerVersionZeroVer(t *testing.T) {
+	// Local version 0.1 maps to GitHub release v2.5.0
+	tests := []struct {
+		latest  string
+		current string
+		want    bool
+	}{
+		{"v2.4.1", "0.1", false},
+		{"v2.4", "0.1", false},
+		{"v2.5", "0.1", false},
+		{"v2.5.0", "0.1", false},
+		{"v2.5.1", "0.1", true},
+		{"v2.6.0", "0.1", true},
+		{"0.1", "0.1", false},
+		{"0.2", "0.1", true},
+	}
+
+	for _, tt := range tests {
+		got := isNewerVersion(tt.latest, tt.current)
+		if got != tt.want {
+			t.Errorf("isNewerVersion(%q, %q) = %v, want %v", tt.latest, tt.current, got, tt.want)
+		}
 	}
 }
