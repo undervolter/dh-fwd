@@ -295,3 +295,74 @@ func TestPTCPReliableARQ(t *testing.T) {
 		t.Fatalf("remaining in-flight segments = %d, want 0", remaining)
 	}
 }
+
+func TestPTCPInOrderReassembly(t *testing.T) {
+	rx, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rx.Close()
+	rxAddr := rx.LocalAddr().(*net.UDPAddr)
+
+	u := NewUDP("127.0.0.1", rxAddr.Port, false, nil)
+	defer u.Close()
+
+	peerAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: u.conn.LocalAddr().(*net.UDPAddr).Port}
+
+	b1 := (&PTCPPayload{Realm: 0x1234, Payload: []byte("HELLO")}).Bytes()
+	b2 := (&PTCPPayload{Realm: 0x1234, Payload: []byte("WORLD")}).Bytes()
+
+	len1 := uint32(len(b1))
+	len2 := uint32(len(b2))
+
+	// 1. Peer sends Packet 2 first (out of order: seq len1 .. len1+len2)
+	pkt2 := &PTCP{
+		Rlid: len1,
+		Llid: 0,
+		Pid:  0x0000FFFF,
+		Lmid: 2,
+		Body: b2,
+	}
+	rx.WriteTo(pkt2.Bytes(), peerAddr)
+
+	// In the background, wait 40ms then send Packet 1 (seq 0 .. len1)
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		pkt1 := &PTCP{
+			Rlid: 0,
+			Llid: 0,
+			Pid:  0x0000FFFF,
+			Lmid: 1,
+			Body: b1,
+		}
+		rx.WriteTo(pkt1.Bytes(), peerAddr)
+	}()
+
+	// 2. Read first in-order packet: MUST be pkt1
+	p1, err := u.ReadPTCP(500 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("ReadPTCP(p1) failed: %v", err)
+	}
+	pl1, err := ParsePTCPPayload(p1.Body)
+	if err != nil || string(pl1.Payload) != "HELLO" {
+		t.Fatalf("got pl1 = %v, err=%v, want HELLO", pl1, err)
+	}
+
+	// 3. Read second in-order packet: MUST be pkt2 drained from reassembly queue
+	p2, err := u.ReadPTCP(100 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("ReadPTCP(p2) failed: %v", err)
+	}
+	pl2, err := ParsePTCPPayload(p2.Body)
+	if err != nil || string(pl2.Payload) != "WORLD" {
+		t.Fatalf("got pl2 = %v, err=%v, want WORLD", pl2, err)
+	}
+
+	// 4. Cumulative ACK must be len1 + len2
+	u.ptcpMu.Lock()
+	recved := u.ptcpRecv
+	u.ptcpMu.Unlock()
+	if recved != len1+len2 {
+		t.Fatalf("ptcpRecv = %d, want %d", recved, len1+len2)
+	}
+}

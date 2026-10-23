@@ -1,3 +1,9 @@
+[23.10.26] dh-fwd v2.5.0
+- PTCP Transport Upgrade: dynamic Jacobson/Karn RTO calculation (SRTT + 4*RTTVAR) matching Dahua P2PDll.dll CPhonyTcp::processSender
+- Inbound in-order reassembly queue (matching CPhonyTcp::processReceiver): eliminate stream corruption from out-of-order UDP packets
+- Port 80 Web Concurrency Throttle: max 3 concurrent active realms to protect embedded dvrweb from socket exhaustion (DVR DISC)
+- Strict cumulative ACK sequence tracking and exponential backoff on retries
+
 [3.10.26] dh-fwd v2.4.1
 ```md
  - [+] Added flag -ar to force switch the app dialect

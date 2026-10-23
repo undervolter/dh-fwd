@@ -190,6 +190,7 @@ type specGroup struct {
 // Tunnel owns one connection cycle to a device: cloud handshake, NAT punch,
 // PTCP session, and the local TCP listeners multiplexed over it.
 type Tunnel struct {
+	httpSem      chan struct{}
 	serial, username, password, randsalt string
 	chanKey                              []byte // Type-1 channel key, for the post-establishment local-channel step
 	dtype                                int
@@ -377,6 +378,7 @@ func (t *Tunnel) reset() {
 	t.chanKey = nil
 	t.bindWait = make(map[uint32]chan struct{})
 	t.accelResults = make(map[uint32]chan []byte)
+	t.httpSem = make(chan struct{}, 3)
 	t.pools = make(map[int]*poolState)
 	if t.forceAppRelay && !t.poolExplicit {
 		t.poolTarget = 0
@@ -1778,6 +1780,9 @@ func (t *Tunnel) readLoop(done chan struct{}, u *UDP) {
 			}
 			return
 		}
+		if u.HasInflightSegments() {
+			u.CheckRetransmit()
+		}
 		t.routePTCP(p, u)
 	}
 }
@@ -2039,6 +2044,14 @@ func (t *Tunnel) poolKeeper(done chan struct{}, remotePort int) {
 // In TCP-relay mode the realm is a TOU session opened with a SYN frame.
 // On the UDP path a pooled pre-bound realm is preferred: no BIND wait.
 func (t *Tunnel) handleBind(ac acceptConn) {
+	if ac.remotePort == 80 {
+		select {
+		case t.httpSem <- struct{}{}:
+		case <-t.done:
+			ac.conn.Close()
+			return
+		}
+	}
 	// HTTP accelerator: for port-80 connections, try parallel Range fetch to
 	// overcome relay bandwidth limits (~59 KB/s per realm → ~295 KB/s with 5).
 	// Only on the UDP data path; TCP relay has its own flow control.
@@ -2124,6 +2137,12 @@ func (t *Tunnel) handleBind(ac acceptConn) {
 			t.logf("Bind FAILED realm=%#010x port=%d", realmID, ac.remotePort)
 			ac.conn.Close()
 			t.takeBindWait(realmID)
+			if ac.remotePort == 80 {
+				select {
+				case <-t.httpSem:
+				default:
+				}
+			}
 			return
 		case <-t.done:
 			t.takeBindWait(realmID)
@@ -2176,6 +2195,12 @@ func (t *Tunnel) delClient(realmID uint32) {
 	t.clientsMu.Unlock()
 	if c != nil {
 		c.flushNow()
+		if c.remotePort == 80 {
+			select {
+			case <-t.httpSem:
+			default:
+			}
+		}
 	}
 }
 

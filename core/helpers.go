@@ -358,6 +358,14 @@ type UDP struct {
 	lastAckSeen  uint32
 	dupAckCount  int
 
+	srtt         time.Duration
+	rttvar       time.Duration
+	rto          time.Duration
+
+	rcvNxt       uint32
+	rcvOoo       map[uint32]*PTCP
+	rcvReady     []*PTCP
+
 	rxMu     sync.Mutex
 	rxBuf    []byte // reusable receive buffer (single reader per socket)
 	deadline time.Time
@@ -374,7 +382,11 @@ func NewUDP(host string, port int, debug bool, prof *appProfile) *UDP {
 	if prof == nil {
 		prof = smartpssProfile
 	}
-	u := &UDP{rhost: host, rport: port, debug: debug, profile: prof, rxBuf: make([]byte, udpRxMax)}
+	u := &UDP{
+		rhost: host, rport: port, debug: debug, profile: prof, rxBuf: make([]byte, udpRxMax),
+		rcvOoo: make(map[uint32]*PTCP),
+		rto:    250 * time.Millisecond,
+	}
 	pc, err := udpListenCfg.ListenPacket(context.Background(), "udp4", "0.0.0.0:0")
 	if err != nil {
 		u.initErr = err
@@ -732,54 +744,140 @@ func (u *UDP) ScheduleAck() {
 }
 
 // ReadPTCP waits for one PTCP frame and updates ack/rmid state.
+// Out-of-order data frames are buffered and delivered in strict contiguous sequence
+// (Dahua CPhonyTcp::processReceiver parity).
 func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
-	data, err := u.Recv(4096, timeout)
-	if err != nil {
-		return nil, err
-	}
-	ptcp, err := ParsePTCP(data)
-	if err != nil {
-		return nil, err
-	}
-
 	u.ptcpMu.Lock()
-	if ptcp.Rlid+uint32(len(ptcp.Body)) > u.ptcpRecv {
-		u.ptcpRecv = ptcp.Rlid + uint32(len(ptcp.Body))
-	}
-	u.rmid = ptcp.Lmid
-
-	// Advance peer ACK and prune confirmed in-flight data segments
-	if ptcp.Llid > u.peerAck {
-		u.peerAck = ptcp.Llid
-	}
-	if len(u.ptcpSegments) > 0 {
-		var remaining []*ptcpSegment
-		for _, seg := range u.ptcpSegments {
-			if seg.endSeq > ptcp.Llid {
-				remaining = append(remaining, seg)
-			}
-		}
-		u.ptcpSegments = remaining
-
-		// Fast Retransmit on 3 duplicate ACKs (parity with Dahua CPhonyTcp line 89)
-		if ptcp.Llid == u.lastAckSeen && len(u.ptcpSegments) > 0 {
-			u.dupAckCount++
-			if u.dupAckCount == 3 {
-				first := u.ptcpSegments[0]
-				if first.retries < 5 {
-					first.retries++
-					first.sentAt = time.Now()
-					u.Send(first.raw)
-				}
-			}
-		} else if ptcp.Llid > u.lastAckSeen {
-			u.lastAckSeen = ptcp.Llid
-			u.dupAckCount = 0
-		}
+	if len(u.rcvReady) > 0 {
+		ptcp := u.rcvReady[0]
+		u.rcvReady = u.rcvReady[1:]
+		u.ptcpMu.Unlock()
+		return ptcp, nil
 	}
 	u.ptcpMu.Unlock()
 
-	return ptcp, nil
+	deadline := time.Now().Add(timeout)
+	for {
+		remTimeout := time.Until(deadline)
+		if remTimeout <= 0 {
+			return nil, context.DeadlineExceeded
+		}
+
+		data, err := u.Recv(4096, remTimeout)
+		if err != nil {
+			return nil, err
+		}
+		ptcp, err := ParsePTCP(data)
+		if err != nil {
+			return nil, err
+		}
+		if len(ptcp.Body) > 0 {
+			bodyCopy := make([]byte, len(ptcp.Body))
+			copy(bodyCopy, ptcp.Body)
+			ptcp.Body = bodyCopy
+		}
+
+		u.ptcpMu.Lock()
+		u.rmid = ptcp.Lmid
+
+		// Advance peer ACK and prune confirmed in-flight data segments
+		if ptcp.Llid > u.peerAck {
+			u.peerAck = ptcp.Llid
+		}
+		if len(u.ptcpSegments) > 0 {
+			var remaining []*ptcpSegment
+			for _, seg := range u.ptcpSegments {
+				if seg.endSeq > ptcp.Llid {
+					remaining = append(remaining, seg)
+				} else if seg.retries == 0 {
+					// Jacobson/Karn RTT sampling: only sample segments cleanly ACKed on first try
+					sample := time.Since(seg.sentAt)
+					if sample > 0 && sample < 60*time.Second {
+						if u.srtt == 0 {
+							u.srtt = sample
+							u.rttvar = sample / 2
+						} else {
+							diff := sample - u.srtt
+							if diff < 0 {
+								diff = -diff
+							}
+							u.rttvar = (3*u.rttvar + diff) / 4
+							u.srtt = (7*u.srtt + sample) / 8
+						}
+						rto := u.srtt + 4*u.rttvar
+						if rto < 250*time.Millisecond {
+							rto = 250 * time.Millisecond
+						} else if rto > 60*time.Second {
+							rto = 60 * time.Second
+						}
+						u.rto = rto
+					}
+				}
+			}
+			u.ptcpSegments = remaining
+
+			// Fast Retransmit on 3 duplicate ACKs (parity with Dahua CPhonyTcp line 89)
+			if ptcp.Llid == u.lastAckSeen && len(u.ptcpSegments) > 0 {
+				u.dupAckCount++
+				if u.dupAckCount == 3 {
+					first := u.ptcpSegments[0]
+					if first.retries < 5 {
+						first.retries++
+						first.sentAt = time.Now()
+						u.Send(first.raw)
+					}
+				}
+			} else if ptcp.Llid > u.lastAckSeen {
+				u.lastAckSeen = ptcp.Llid
+				u.dupAckCount = 0
+			}
+		}
+
+		// In Dahua PTCP, only 0x10 frames carry stream data (PTCPPayload).
+		// All other frames (0x00 SYNC, 0x0a ping, 0x12 CONN/DISC, 0x13 heartbeat, 0x17 token)
+		// are control frames that do not consume stream sequence space.
+		if len(ptcp.Body) == 0 || ptcp.Body[0] != 0x10 {
+			u.ptcpMu.Unlock()
+			return ptcp, nil
+		}
+
+
+
+		if ptcp.Rlid == u.rcvNxt {
+			// Expected in-sequence packet
+			u.rcvNxt += uint32(len(ptcp.Body))
+			u.ptcpRecv = u.rcvNxt
+
+			// Drain contiguous segments already buffered in out-of-order map
+			for {
+				next, ok := u.rcvOoo[u.rcvNxt]
+				if !ok {
+					break
+				}
+				delete(u.rcvOoo, u.rcvNxt)
+				u.rcvNxt += uint32(len(next.Body))
+				u.ptcpRecv = u.rcvNxt
+				u.rcvReady = append(u.rcvReady, next)
+			}
+			u.ptcpMu.Unlock()
+			return ptcp, nil
+		}
+
+		if ptcp.Rlid > u.rcvNxt {
+			// Out-of-order segment: buffer it and send immediate duplicate ACK for rcvNxt
+			if len(u.rcvOoo) < 128 {
+				u.rcvOoo[ptcp.Rlid] = ptcp
+			}
+			u.ptcpMu.Unlock()
+			u.RequestPTCP(nil)
+			continue
+		}
+
+		// ptcp.Rlid < u.rcvNxt: duplicate or retransmitted segment already consumed
+		u.ptcpMu.Unlock()
+		u.RequestPTCP(nil)
+		continue
+	}
 }
 
 // RequestPTCP serializes and sends one PTCP frame, advancing counters.
@@ -837,9 +935,20 @@ func (u *UDP) CheckRetransmit() int {
 		return 0
 	}
 	now := time.Now()
+	baseRTO := u.rto
+	if baseRTO < 250*time.Millisecond {
+		baseRTO = 250 * time.Millisecond
+	}
 	retransmitted := 0
 	for _, seg := range u.ptcpSegments {
-		if now.Sub(seg.sentAt) >= 300*time.Millisecond && seg.retries < 5 {
+		curRTO := baseRTO
+		if seg.retries > 0 {
+			curRTO = baseRTO * time.Duration(1<<seg.retries)
+			if curRTO > 60*time.Second {
+				curRTO = 60 * time.Second
+			}
+		}
+		if now.Sub(seg.sentAt) >= curRTO && seg.retries < 5 {
 			seg.retries++
 			seg.sentAt = now
 			u.Send(seg.raw)
@@ -847,6 +956,13 @@ func (u *UDP) CheckRetransmit() int {
 		}
 	}
 	return retransmitted
+}
+
+// HasInflightSegments returns whether unacknowledged PTCP data frames exist.
+func (u *UDP) HasInflightSegments() bool {
+	u.ptcpMu.Lock()
+	defer u.ptcpMu.Unlock()
+	return len(u.ptcpSegments) > 0
 }
 
 func GetInvertedBytes(data []byte) []byte {
