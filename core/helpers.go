@@ -169,16 +169,11 @@ func ParsePTCPPayload(data []byte) (*PTCPPayload, error) {
 	if len(data) < 12 {
 		return nil, errors.New("packet too short")
 	}
-	length := binary.BigEndian.Uint32(data[0:4])
 	realm := binary.BigEndian.Uint32(data[4:8])
-	pad := binary.BigEndian.Uint32(data[8:12])
-	if pad != 0 {
-		return nil, errors.New("invalid padding")
-	}
-	length &= 0xFFFF
+	length := int(binary.BigEndian.Uint16(data[2:4]))
 	body := data[12:]
-	if len(body) != int(length) {
-		return nil, errors.New("invalid length")
+	if length > 0 && len(body) >= length {
+		body = body[:length]
 	}
 	return &PTCPPayload{Realm: realm, Payload: body}, nil
 }
@@ -744,18 +739,7 @@ func (u *UDP) ScheduleAck() {
 }
 
 // ReadPTCP waits for one PTCP frame and updates ack/rmid state.
-// Out-of-order data frames are buffered and delivered in strict contiguous sequence
-// (Dahua CPhonyTcp::processReceiver parity).
 func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
-	u.ptcpMu.Lock()
-	if len(u.rcvReady) > 0 {
-		ptcp := u.rcvReady[0]
-		u.rcvReady = u.rcvReady[1:]
-		u.ptcpMu.Unlock()
-		return ptcp, nil
-	}
-	u.ptcpMu.Unlock()
-
 	deadline := time.Now().Add(timeout)
 	for {
 		remTimeout := time.Until(deadline)
@@ -833,50 +817,11 @@ func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
 			}
 		}
 
-		// In Dahua PTCP, only 0x10 frames carry stream data (PTCPPayload).
-		// All other frames (0x00 SYNC, 0x0a/0x0e ping/flow, 0x12 CONN/DISC, 0x13 heartbeat, 0x17 token)
-		// are control frames that do not consume stream sequence space.
-		if len(ptcp.Body) == 0 || ptcp.Body[0] != 0x10 {
-			u.ptcpMu.Unlock()
-			return ptcp, nil
+		if ptcp.Rlid+uint32(len(ptcp.Body)) > u.ptcpRecv {
+			u.ptcpRecv = ptcp.Rlid + uint32(len(ptcp.Body))
 		}
-
-
-
-		if ptcp.Rlid == u.rcvNxt {
-			// Expected in-sequence packet
-			u.rcvNxt += uint32(len(ptcp.Body))
-			u.ptcpRecv = u.rcvNxt
-
-			// Drain contiguous segments already buffered in out-of-order map
-			for {
-				next, ok := u.rcvOoo[u.rcvNxt]
-				if !ok {
-					break
-				}
-				delete(u.rcvOoo, u.rcvNxt)
-				u.rcvNxt += uint32(len(next.Body))
-				u.ptcpRecv = u.rcvNxt
-				u.rcvReady = append(u.rcvReady, next)
-			}
-			u.ptcpMu.Unlock()
-			return ptcp, nil
-		}
-
-		if ptcp.Rlid > u.rcvNxt {
-			// Out-of-order segment: buffer it and send immediate duplicate ACK for rcvNxt
-			if len(u.rcvOoo) < 128 {
-				u.rcvOoo[ptcp.Rlid] = ptcp
-			}
-			u.ptcpMu.Unlock()
-			u.RequestPTCP(nil)
-			continue
-		}
-
-		// ptcp.Rlid < u.rcvNxt: duplicate or retransmitted segment already consumed
 		u.ptcpMu.Unlock()
-		u.RequestPTCP(nil)
-		continue
+		return ptcp, nil
 	}
 }
 

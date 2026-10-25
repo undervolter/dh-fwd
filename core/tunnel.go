@@ -2391,6 +2391,9 @@ func (t *Tunnel) clientReader(conn net.Conn, realmID uint32) {
 			atomic.AddUint64(&c.dataUp, uint64(n))
 		}
 		atomic.AddUint64(&GlobalBytesUp, uint64(n))
+		if t.debug {
+			t.logf("Client realm=%#010x read %d bytes from client", realmID, n)
+		}
 		t.writeRealmData(realmID, buf[:n])
 	}
 }
@@ -2412,6 +2415,7 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 	case 0x10:
 		pl, err := ParsePTCPPayload(p.Body)
 		if err != nil {
+			t.logf("ParsePTCPPayload error: %v (hex=%x)", err, p.Body)
 			return
 		}
 		if t.dispatchAccelData(pl.Realm, pl.Payload) {
