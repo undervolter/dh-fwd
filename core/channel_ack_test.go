@@ -261,7 +261,7 @@ func TestWaitChannelEarlyAckAcceptsCSeqZero(t *testing.T) {
 					"CSeq: "+strconv.FormatUint(uint64(cs.req.cseq), 10), "CSeq: 0", 1)
 			}
 			p.sendLater(from, 0, cseqZero("100 Trying", ""))
-			p.sendLater(from, testAckWindow/4, cseqZero("200 OK", "<body><PubAddr>127.0.0.1:25024</PubAddr></body>"))
+			p.sendLater(from, testAckWindow/6, cseqZero("200 OK", "<body><PubAddr>127.0.0.1:25024</PubAddr></body>"))
 		})
 	})
 
