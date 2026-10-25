@@ -25,14 +25,6 @@ Software for creating tunnels to a Dahua camera (by serial number), forwarding a
 > [!CAUTION]
 > Before **2024**, Dahua's P2P servers established connections *without authentication*. After all the fuss over the protocol's vulnerability, devices released after 2024.07 now require authentication.
 
-> [!NOTE]
-> Also, Dahua may reject requests if you have a time desync.
-
-> [!IMPORTANT]
-> If the connection to the camera goes through an intermediate server, the web panel might not work! This is dh-fwd's issue that will be fixed (hopefully) at 0.2
-
-## Known issues
- - 80 and others ports are not working at FW 5.x.x
 ## Build
 
 ```sh
