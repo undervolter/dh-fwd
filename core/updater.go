@@ -135,11 +135,14 @@ func isNewerVersion(latest, current string) bool {
 	lParts := parseSemVer(latest)
 	cParts := parseSemVer(current)
 
-	// ZeroVer mapping: local "0.1" corresponds to GitHub release tag v2.5.
-	// If current is 0.1 and upstream GitHub release uses the v2.x tag format,
-	// map current baseline to [2, 5, 0] so older releases (v2.4.x, v2.5) won't trigger false updates.
-	if cParts[0] == 0 && cParts[1] == 1 && lParts[0] == 2 {
-		cParts = [3]int{2, 5, 0}
+	// We are on ZeroVer (0.x). Any legacy upstream tag (v1.x, v2.x) from before
+	// the ZeroVer transition is older than the current ZeroVer codebase.
+	if cParts[0] == 0 && lParts[0] >= 1 {
+		return false
+	}
+	// If current is legacy and latest is ZeroVer, latest is newer.
+	if cParts[0] >= 1 && lParts[0] == 0 {
+		return true
 	}
 
 	for i := 0; i < 3; i++ {
