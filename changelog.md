@@ -1,4 +1,4 @@
-[25.10.26] dh-fwd 0.2 (GitHub: v2.6.0)
+[25.10.26] dh-fwd 0.2
 ```md
  - [~] fixed: устранён дедлок очереди ReadPTCP (rcvNxt/rcvOoo), блокировавший приём данных веб-морды в браузере | fixed: eliminated ReadPTCP reassembly deadlock causing browser hang on pending HTTP connections
  - [~] fixed: убрана ложная проверка версии 5.x как "2024+", ломавшая пул реалмов | fixed: removed false "2024+" version check that killed the realm pool
