@@ -111,7 +111,14 @@ func ResetBytesStats() {
 	atomic.StoreUint64(&GlobalBytesUp, 0)
 	atomic.StoreUint64(&GlobalBytesDown, 0)
 }
-var errPTCPAppFallback = errors.New("ptcp token spam: app dialect fallback")
+const (
+	ptcpTypePause     = 0x17
+	ptcpTypePauseAck  = 0x18
+	ptcpTypeResume    = 0x19
+	ptcpTypeResumeAck = 0x1A
+	pauseSafetyLimit  = 30 * time.Second // resume anyway if peer never sends 0x19
+	unknownLogEvery   = 5 * time.Second  // rate-limits unknown frame logging
+)
 
 var ptcpHeartbeat = []byte{
 	0x13, 0x00, 0x00, 0x00,
@@ -130,10 +137,9 @@ type Client struct {
 	cseq          int
 	remotePort    int
 
-	// Data-path liveness counters (zombieWatchdog): dataUp — ±°№‚‹,
-	// €µ€µ ‚ »µ‚°  ‚µ»; dataDown — ±°№‚‹ DATA, €µ€µ
-	// ±°‚. created — µ‚ »‡µ »µ‚°. …·°† —
-	// sync/atomic.
+	// Data-path liveness counters (zombieWatchdog): dataUp: bytes sent upstream;
+	// dataDown: DATA bytes received from peer; created: connection timestamp.
+	// Accessed via sync/atomic.
 	created  time.Time
 	dataUp   uint64
 	dataDown uint64
@@ -221,11 +227,7 @@ type Tunnel struct {
 	logRetries                           bool
 	useTCP                               bool // force TCP-relay data path
 
-	// forceAppRelay — data path  °-°»µ‚µ (SYNC only, ±µ· 0x17/0x19).
-	// ‚°‚ zombieWatchdog' »µ ·±-µ‚µ‚°: »°‡µ№
-	// 0x17/0x19 ° data-µ‚µ °»µ‚ °°» ° »µ… 2024+
-	// (BIND'‹ »‡°‚ ack', DATA µ ‚‚). Sticky: reset() • ‡‚‚,
-	// µ‚°№ runWithRetries ‘‚ °·  °-°»µ‚µ.
+	// forceAppRelay — forces app relay dialect (fresh BIND per realm, realm pooling off).
 	forceAppRelay bool
 
 	specs    []PortSpec
@@ -308,6 +310,26 @@ type Tunnel struct {
 	poolExplicit bool
 	hasServed    bool
 
+	// paused: set by an inbound 0x17 PAUSE (flow control / link switch),
+	// cleared by 0x19 RESUME. While paused, clientReader holds local TCP bytes.
+	paused atomic.Bool
+
+	// Link-switch event channels (reset() creates them)
+	switchPauseAck  chan uint32
+	switchResumeAck chan struct{}
+
+	// Allocated relay agent (for teardown unbind)
+	relayAgentHost string
+	relayAgentPort int
+	relayAgentTok  string
+
+	// Unknown-frame rate-limiting in routePTCP
+	unknownMu         sync.Mutex
+	unknownLastType   byte
+	unknownLastLen    int
+	unknownLastAt     time.Time
+	unknownSuppressed uint64
+
 	// Wire-safe MTU and PTCP segment sizing (auto-detected or forced via --mtu).
 	userMTU    int
 	segmentMax int
@@ -342,7 +364,7 @@ func (t *Tunnel) setPrimaryRelay(u *UDP) {
 
 func newTunnel(serial string, prof *appProfile, dtype int, username, password, randsalt string, debug, logRetries bool, forceTCP bool, poolSize int, poolExplicit bool, g specGroup, reg *PortRegistry, mtu ...int) *Tunnel {
 	// The app relay dialect binds each realm FRESH, seconds before use
-	// (capture: BIND †’ 0x12 CONN †’ DATA, ~6 ms apart). Pre-bound realms go
+	// (capture: BIND -> 0x12 CONN -> DATA, ~6 ms apart). Pre-bound realms go
 	// stale device-side and their DATA is discarded, so pooling is disabled
 	// for noRelayAuth profiles — UNLESS the operator passed --pool
 	// explicitly (poolExplicit): an explicit level always wins.
@@ -386,6 +408,7 @@ func newTunnel(serial string, prof *appProfile, dtype int, username, password, r
 // the previous attempt so they cannot poison the new state.
 func (t *Tunnel) reset() {
 	t.readerWG.Wait()
+	t.unbindRelayAgent()
 	t.listeners = nil
 	t.clients = make(map[uint32]*Client)
 	t.acceptCh = make(chan acceptConn, 16)
@@ -402,6 +425,8 @@ func (t *Tunnel) reset() {
 	t.bindWait = make(map[uint32]chan struct{})
 	t.accelResults = make(map[uint32]chan []byte)
 	t.httpSem = make(chan struct{}, 3)
+	t.switchPauseAck = make(chan uint32, 1)
+	t.switchResumeAck = make(chan struct{}, 1)
 	t.pools = make(map[int]*poolState)
 	if t.forceAppRelay && !t.poolExplicit {
 		t.poolTarget = 0
@@ -417,6 +442,7 @@ func (t *Tunnel) reset() {
 }
 
 func (t *Tunnel) close() {
+	t.unbindRelayAgent()
 	select {
 	case <-t.done:
 	default:
@@ -452,6 +478,88 @@ func (t *Tunnel) close() {
 	}
 	if tou != nil {
 		tou.close()
+	}
+}
+
+// tryLinkSwitch migrates a live relay session onto the punched direct
+// channel the way P2PDll's CP2PLinkThroughClient::procLinkSwitch
+// (sub_18001EF00) does:
+//	PAUSE (0x17) → PauseAck (0x18, value@[12:16]) within 2 s
+//	→ SYNC on direct channel, primary flips
+//	→ RESUME (0x19) carrying echoed value → ResumeAck (0x1A) within 2 s
+//	→ on ResumeAck timeout: retry RESUME once over relay channel
+func (t *Tunnel) tryLinkSwitch() {
+	t.socksMu.Lock()
+	mr, dr := t.mainRemote, t.deviceRemote
+	t.socksMu.Unlock()
+	if mr == nil || dr == nil || t.getPrimary() != mr {
+		return
+	}
+
+	t.logf("link switch: direct punch confirmed — pausing relay path")
+	t.paused.Store(true)
+	defer t.paused.Store(false)
+
+	pause := []byte{ptcpTypePause, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	mr.RequestPTCP(pause)
+	var value uint32
+	select {
+	case value = <-t.switchPauseAck:
+		t.logf("link switch: PauseAck received (value=%#010x)", value)
+	case <-time.After(2 * time.Second):
+		t.logf("link switch: PauseAck timeout — staying on relay")
+		return
+	case <-t.done:
+		return
+	}
+
+	dr.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
+	t.setPrimary(dr)
+
+	resume := make([]byte, 16)
+	resume[0] = ptcpTypeResume
+	binary.BigEndian.PutUint32(resume[12:16], value)
+	dr.RequestPTCP(resume)
+	select {
+	case <-t.switchResumeAck:
+		t.logf("link switch: ResumeAck — session upgraded to direct path")
+		fmt.Println("\033[32m[+]\033[0m Link switched to the direct path")
+		return
+	case <-time.After(2 * time.Second):
+		t.logf("link switch: ResumeAck timeout on direct — retrying RESUME over relay")
+	case <-t.done:
+		return
+	}
+	mr.RequestPTCP(resume)
+	select {
+	case <-t.switchResumeAck:
+		t.logf("link switch: ResumeAck over relay — direct path active")
+		fmt.Println("\033[32m[+]\033[0m Link switched to the direct path")
+	case <-time.After(2 * time.Second):
+		t.logf("link switch: ResumeAck lost — staying migrated; liveness machinery takes over")
+	case <-t.done:
+	}
+}
+
+// unbindRelayAgent releases the relay agent allocation the way P2PDll does:
+// a best-effort /relay/unbind/<token> to the agent (sub_180047320).
+func (t *Tunnel) unbindRelayAgent() {
+	t.socksMu.Lock()
+	host, port, tok := t.relayAgentHost, t.relayAgentPort, t.relayAgentTok
+	t.relayAgentHost, t.relayAgentPort, t.relayAgentTok = "", 0, ""
+	t.socksMu.Unlock()
+	if host == "" || port <= 0 || tok == "" {
+		return
+	}
+	u := NewUDP(host, port, false, t.profile)
+	defer u.Close()
+	if u.initErr != nil {
+		t.logf("relay unbind: socket to %s:%d failed (%v)", host, port, u.initErr)
+		return
+	}
+	u.RequestEx("/relay/unbind/"+tok, "", true, false, reqOpts{})
+	if res, err := u.Read(true, time.Second); err == nil && res != nil {
+		t.logf("relay unbind: agent %s:%d code %d", host, port, res.Code)
 	}
 }
 
@@ -534,7 +642,7 @@ func newChannelRequest(prof *appProfile, dtype int, username, password, randsalt
 		// once — retransmissions replay this exact value.
 		cseq:     nextCSeqFor(prof),
 		identify: identifyHex(aid, prof),
-		created:  time.Now().Unix(),
+		created:  nowAdjusted().Unix(),
 	}
 	if prof.pcsRequestID {
 		cr.pcsID = randomHex(16)
@@ -598,7 +706,7 @@ func localAddrPrefixes(bindIP string) []string {
 // buildLocalAddr renders the LocalAddr payload the way the DMSS app emits
 // it: a comma-separated list of bare-IP interface prefixes followed by the
 // final "bindIP:port" entry. This is the DMSS app's wire form, kept for app
-// parity: the earlier "single-entry †’ 403" live bracket (2026-09-06) ran
+// parity: the earlier "single-entry -> 403" live bracket (2026-09-06) ran
 // with dh-fwd's header serialization and is confounded — later live
 // evidence showed the header serialization was the discriminator, not the
 // LocalAddr shape. At least one prefix is mandatory; when the host exposes
@@ -716,43 +824,6 @@ func (t *Tunnel) handshake() error {
 	return nil
 }
 
-// waitForPTCPToken reads PTCP frames until one carries a plausible 0x17
-// token body — the sign the caller slices off at [12:]. Frames with
-// shorter bodies are drained and skipped: the relay agent's late 4-byte
-// SYNC ack used to slip past the old "non-empty body" guard and panic
-// the [12:] slice (slice bounds [12:4] crash loop — live gate round 3,
-// 2026-09-06). A sub-13-byte body can never be the token, so draining it
-// is strictly safer; if the token never arrives, the read timeout
-// surfaces as a regular error instead of a process-killing panic.
-func (t *Tunnel) waitForPTCPToken(u *UDP, timeout time.Duration) (*PTCP, error) {
-	deadline := time.Now().Add(timeout)
-	shorts := 0
-	for {
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			return nil, fmt.Errorf("ptcp token timeout (%d short/heartbeat frames)", shorts)
-		}
-		if remain > 5*time.Second {
-			remain = 5 * time.Second
-		}
-		p, err := u.ReadPTCP(remain)
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			return nil, err
-		}
-		if len(p.Body) <= 12 || p.Body[0] == 0x13 {
-			shorts++
-			if shorts >= 5 {
-				return nil, errPTCPAppFallback
-			}
-			t.logf("ptcp 0x17: discarding short body (%d bytes: %x) — waiting for token", len(p.Body), p.Body)
-			continue
-		}
-		return p, nil
-	}
-}
 
 // establish runs the full 4-phase connection: cloud discovery, relay agent
 // allocation, Server Nat Info, inverted STUN punch and PTCP negotiation.
@@ -844,8 +915,7 @@ func (t *Tunnel) establish() error {
 		relay := strings.SplitN(res.Body["body/Address"], ":", 2)
 		relayHost = relay[0]
 		relayPort, _ = strconv.Atoi(relay[1])
-		// —°°µ µ‚‡µ » ‚°†: allocRelayAgent  ‚€µ
-		// µµ№‘‚ ° ·°°№ °µ · µ€°.
+		// Cache dispatcher address for alternates
 		relayDispatch.remember(res.Body["body/Address"])
 	}
 
@@ -910,9 +980,7 @@ func (t *Tunnel) establish() error {
 				agentPort, _ = strconv.Atoi(agent[1])
 			}
 		} else {
-			// “»±°»‹№ µ°„ + per-host backoff + ‚°† ° ·°°№
-			// µ‚‡µ (easy4ip »‚°µ‚  70% alloc-°‚°°
-			// °·№, live 2026-09-13).
+			// Per-host backoff and alternates via allocRelayAgent
 			var ok bool
 			agentHost, agentPort, agentToken, ok = t.allocRelayAgent(mainRemote, fmt.Sprintf("%s:%d", relayHost, relayPort))
 			if !ok {
@@ -922,6 +990,9 @@ func (t *Tunnel) establish() error {
 	}
 	agentOK := agentHost != ""
 	if agentOK {
+		t.socksMu.Lock()
+		t.relayAgentHost, t.relayAgentPort, t.relayAgentTok = agentHost, agentPort, agentToken
+		t.socksMu.Unlock()
 		t.startRelayAgent(mainRemote, agentHost, agentPort, agentToken)
 	}
 
@@ -941,6 +1012,7 @@ func (t *Tunnel) establish() error {
 		res = early
 	}
 	if res.Code >= 400 {
+		maybeUpdateTimeOffset(res, t.logf)
 		if res.Code == 404 {
 			return errDeviceNotFound
 		}
@@ -1036,31 +1108,10 @@ func (t *Tunnel) establish() error {
 		t.statusf(PhaseNATPunch, "PTCP sync")
 		mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 		t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-		p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
-		if err != nil {
+		if _, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT); err != nil {
 			return fmt.Errorf("relay ptcp sync: %w", err)
 		}
 		mainRemote.RequestPTCP(nil)
-		if !t.profile.noRelayAuth && !t.forceAppRelay && !ForceAppRelay {
-			t.statusf(PhaseNATPunch, "PTCP token")
-			mainRemote.RequestPTCP([]byte{
-				0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-				0x00, 0x00, 0x00, 0x00,
-			})
-			t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-			p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
-			if err != nil {
-				if errors.Is(err, errPTCPAppFallback) {
-					t.forceAppRelay = true
-					t.logf("ptcp 0x17: token not supported by relay (heartbeat spam), switching to app relay dialect")
-				} else {
-					return fmt.Errorf("relay ptcp 0x17: %w", err)
-				}
-			} else {
-				_ = p.Body
-				mainRemote.RequestPTCP(nil)
-			}
-		}
 		t.statusf(PhasePTCPHandshake, "relay path")
 		t.setPrimary(mainRemote)
 		return nil
@@ -1092,33 +1143,11 @@ func (t *Tunnel) establish() error {
 			t.statusf(PhaseNATPunch, "PTCP sync")
 			mainRemote.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
 			t.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-			p, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT)
-			if err != nil {
+			if _, err := mainRemote.ReadPTCP(RELAY_READ_TIMEOUT); err != nil {
 				relayErr = err
 				return
 			}
 			mainRemote.RequestPTCP(nil)
-			if !t.profile.noRelayAuth && !t.forceAppRelay && !ForceAppRelay {
-				t.statusf(PhaseNATPunch, "PTCP token")
-				mainRemote.RequestPTCP([]byte{
-					0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-					0x00, 0x00, 0x00, 0x00,
-				})
-				t.logf("waiting for ptcp 0x17 (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-				p, err = t.waitForPTCPToken(mainRemote, RELAY_READ_TIMEOUT)
-				if err != nil {
-					if errors.Is(err, errPTCPAppFallback) {
-						t.forceAppRelay = true
-						t.logf("ptcp 0x17: token not supported by relay (heartbeat spam), switching to app relay dialect")
-					} else {
-						relayErr = err
-						return
-					}
-				} else {
-					_ = p.Body
-					mainRemote.RequestPTCP(nil)
-				}
-			}
 		}()
 	} else {
 		close(relayDone)
@@ -1317,11 +1346,12 @@ func (t *Tunnel) establish() error {
 				setPrimaryRelay(mainRemote)
 
 				// Relay won the race: stay on reliable Relay path.
-				// Background STUN can finish without hijacking tunnel away from relay.
 				go func() {
-					if res, ok := <-stunChan; ok && len(res.data) > 0 {
-						t.logf("Background STUN punch also succeeded (peer reachable directly)")
+					res, ok := <-stunChan
+					if !ok || len(res.data) == 0 {
+						return
 					}
+					t.tryLinkSwitch()
 				}()
 				return nil
 			}
@@ -1499,6 +1529,7 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 			}
 			// Error responses (401, 403, 404, etc.)
 			if res.Code >= 400 {
+				maybeUpdateTimeOffset(res, t.logf)
 				return fmt.Errorf("relay-channel rejected (code %d: %s)", res.Code, res.Status)
 			}
 		}
@@ -1524,7 +1555,7 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 }
 
 func waitChannelEarlyAck(u *UDP, cs *channelSender, logf func(string, ...any), ackWindow time.Duration) *DHResponse {
-	step := ackWindow / 3 // default 1.8 s †’ re-sends at ~0.6 s / ~1.2 s (capture: ~0.55 s / ~1.1 s)
+	step := ackWindow / 3 // default 1.8 s -> re-sends at ~0.6 s / ~1.2 s (capture: ~0.55 s / ~1.1 s)
 	start := time.Now()
 	deadline := start.Add(ackWindow)
 	nextSend := start.Add(step)
@@ -1560,6 +1591,7 @@ func waitChannelEarlyAck(u *UDP, cs *channelSender, logf func(string, ...any), a
 		// echo), so they can never correlate — surface the real error.
 		if res.Code >= 400 {
 			logf("p2p-channel: terminal %d %s — surfacing as the outcome", res.Code, res.Status)
+			maybeUpdateTimeOffset(res, logf)
 			return res
 		}
 
@@ -1618,6 +1650,24 @@ func respHeader(res *DHResponse, name string) string {
 		}
 	}
 	return ""
+}
+
+// maybeUpdateTimeOffset harvests ServerTime carried by 401/403 responses
+// (P2PDll: "Response 401 with ServerTime[%s]…" → CTimeOffset::updateOffset).
+func maybeUpdateTimeOffset(res *DHResponse, logf func(string, ...any)) {
+	if res == nil {
+		return
+	}
+	if v := respHeader(res, "ServerTime"); v != "" {
+		updateServerTimeOffset(v, logf)
+		return
+	}
+	for _, k := range []string{"body/ServerTime", "body/servertime"} {
+		if v := res.Body[k]; v != "" {
+			updateServerTimeOffset(v, logf)
+			return
+		}
+	}
 }
 
 // localChannelAckTimeout bounds the best-effort local-channel ack read.
@@ -1683,48 +1733,7 @@ func (t *Tunnel) sendLocalChannel(step localChannelStep) {
 	t.logf("%s profile: local-channel: %d %s", t.profile.name, res.Code, res.Status)
 }
 
-// ptcpHandshake runs SYNC -> AUTH_REQ(0x19+sign) -> AUTH_RESP(0x1A) ->
-// AUTH_FINAL(0x1B) against the peer on socket u.
-func ptcpHandshake(u *UDP, signToken []byte) error {
-	u.RequestPTCP([]byte{0x00, 0x03, 0x01, 0x00})
-	u.logf("waiting for ptcp sync (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-	p, err := u.ReadPTCP(RELAY_READ_TIMEOUT)
-	if err != nil {
-		return err
-	}
-	if string(p.Body) != "\x00\x03\x01\x00" {
-		return fmt.Errorf("ptcp sync mismatch")
-	}
 
-	pkt := append([]byte{0x19, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, signToken...)
-	u.RequestPTCP(pkt)
-	u.logf("waiting for ptcp auth (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-	p, err = u.ReadPTCP(RELAY_READ_TIMEOUT)
-	if err != nil {
-		return err
-	}
-	for len(p.Body) == 0 {
-		u.logf("waiting for ptcp auth body (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-		p, err = u.ReadPTCP(RELAY_READ_TIMEOUT)
-		if err != nil {
-			return err
-		}
-	}
-	if p.Body[0] != 0x1A {
-		return fmt.Errorf("ptcp auth mismatch: got 0x%02x", p.Body[0])
-	}
-
-	u.RequestPTCP([]byte{0x1B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-	u.logf("waiting for ptcp final (timeout %.0fs)", RELAY_READ_TIMEOUT.Seconds())
-	p, err = u.ReadPTCP(RELAY_READ_TIMEOUT)
-	if err != nil {
-		return err
-	}
-	if len(p.Body) != 0 {
-		return fmt.Errorf("ptcp final expected empty")
-	}
-	return nil
-}
 
 // serve opens the local listeners and pumps traffic until the tunnel dies.
 // IsDirect reports whether the active data path is direct UDP (STUN punch), rather than relay.
@@ -1832,8 +1841,7 @@ func (t *Tunnel) serve() error {
 		go t.readLoop(done, t.deviceRemote)
 		go t.readLoop(done, t.mainRemote)
 		go t.heartbeatLoop(done)
-		// Zombie watchdog: up-traffic ±µ· µ ‚µ‚ ±°№‚° —
-		// „µ№» ‚µ»  µ‚°№  °-°»µ‚µ.
+		// Zombie watchdog: detects dead relay paths where upload traffic receives 0 bytes back.
 		go t.zombieWatchdog(done)
 		// Realm pool keepers: maintain pre-bound realms per forwarded port
 		// so browser connection waves never pay the BIND round-trip.
@@ -2394,6 +2402,23 @@ func (t *Tunnel) clientReader(conn net.Conn, realmID uint32) {
 		if t.debug {
 			t.logf("Client realm=%#010x read %d bytes from client", realmID, n)
 		}
+		// Peer PAUSE (0x17): hold the bytes — backpressure the local TCP
+		// connection instead of feeding the PTCP send path mid-switch.
+		// Bounded by pauseSafetyLimit so a lost RESUME cannot wedge the
+		// reader forever (the DLL's own state machine always resumes).
+		pauseStart := time.Now()
+		for t.paused.Load() {
+			if time.Since(pauseStart) >= pauseSafetyLimit {
+				t.logf("PTCP pause exceeded %v without RESUME — resuming upstream data", pauseSafetyLimit)
+				t.paused.Store(false)
+				break
+			}
+			select {
+			case <-t.done:
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
 		t.writeRealmData(realmID, buf[:n])
 	}
 }
@@ -2451,20 +2476,66 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 		}
 	case 0x13:
 		// Peer heartbeat — liveness is tracked via lastRecv.
+	case 0x14:
+		// SERVICE: disconnect-class event in DLL. Log only.
+		t.logf("PTCP 0x14 SERVICE frame received")
+	case ptcpTypePauseAck:
+		// 0x18 PauseAck: carries the value at [12:16] that the client
+		// echoes back in the RESUME payload.
+		if len(p.Body) >= 16 {
+			v := binary.BigEndian.Uint32(p.Body[12:16])
+			select {
+			case t.switchPauseAck <- v:
+			default:
+			}
+		}
+	case ptcpTypeResumeAck:
+		// 0x1A ResumeAck: completes the link switch.
+		select {
+		case t.switchResumeAck <- struct{}{}:
+		default:
+		}
+	case ptcpTypePause:
+		// 0x17 PAUSE: peer is migrating links (procLinkSwitch) or applying flow control.
+		if !t.paused.Swap(true) {
+			t.logf("PTCP 0x17 PAUSE — holding upstream data (peer flow control)")
+		}
+	case ptcpTypeResume:
+		// 0x19 RESUME (16 bytes, int payload at [12:16]).
+		if t.paused.Swap(false) {
+			extra := ""
+			if len(p.Body) >= 16 {
+				extra = fmt.Sprintf(" value=%d", int32(binary.BigEndian.Uint32(p.Body[12:16])))
+			}
+			t.logf("PTCP 0x19 RESUME%s — upstream data flowing again", extra)
+		}
 	case 0x0a, 0x0e:
 		// Flow-control / ping / buffer feedback frame from device or relay agent; no-op.
 	default:
-		primary := t.getPrimary()
-		var sincePrimary float64
-		if primary != nil {
-			sincePrimary = time.Since(primary.LastRecv()).Seconds()
+		// Rate-limited: avoid flooding logs if peer sends unknown frames
+		t.unknownMu.Lock()
+		sameShape := t.unknownLastType == p.Body[0] && t.unknownLastLen == len(p.Body)
+		if !sameShape || time.Since(t.unknownLastAt) >= unknownLogEvery {
+			if t.unknownSuppressed > 0 {
+				t.logf("PTCP unknown: suppressed %d frames of type=%#04x len=%d", t.unknownSuppressed, t.unknownLastType, t.unknownLastLen)
+				t.unknownSuppressed = 0
+			}
+			primary := t.getPrimary()
+			var sincePrimary float64
+			if primary != nil {
+				sincePrimary = time.Since(primary.LastRecv()).Seconds()
+			}
+			srcStr := "secondary"
+			if src == primary {
+				srcStr = "primary"
+			}
+			t.logf("PTCP type=%#04x len=%d src=%s sincePrimary=%.2fs time=%s hex=%x",
+				p.Body[0], len(p.Body), srcStr, sincePrimary, time.Now().Format("15:04:05.000"), p.Body)
+			t.unknownLastType, t.unknownLastLen, t.unknownLastAt = p.Body[0], len(p.Body), time.Now()
+		} else {
+			t.unknownSuppressed++
 		}
-		srcStr := "secondary"
-		if src == primary {
-			srcStr = "primary"
-		}
-		t.logf("PTCP type=%#04x len=%d src=%s sincePrimary=%.2fs time=%s hex=%x",
-			p.Body[0], len(p.Body), srcStr, sincePrimary, time.Now().Format("15:04:05.000"), p.Body)
+		t.unknownMu.Unlock()
 		if len(p.Body) >= 12 {
 			tryRealm := binary.BigEndian.Uint32(p.Body[4:8])
 			payload := p.Body[12:]
@@ -2634,7 +2705,7 @@ func runWithRetries(t *Tunnel, cp *ConnectProgress, onExhausted func(err error))
 	}
 }
 
-// infoFields flattens a /info/device/<SN> payload into tag†’value: the device
+// infoFields flattens a /info/device/<SN> payload into tag->value: the device
 // answers either with plain JSON or with a DH response wrapping an XML body.
 func infoFields(text string) (map[string]string, error) {
 	fields := map[string]string{}

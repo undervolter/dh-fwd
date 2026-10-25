@@ -233,7 +233,7 @@ func Execute() {
 	flag.BoolVar(&logRetries, "lr", false, "log retry details")
 	flag.DurationVar(&hbTimeout, "heartbeat-timeout", 30*time.Second, "PTCP heartbeat timeout")
 	flag.DurationVar(&hbTimeout, "hb", 30*time.Second, "PTCP heartbeat timeout")
-	flag.BoolVar(&ForceAppRelay, "app-relay", false, "force app relay dialect (skips 0x17/0x19 token auth, for 2024+ devices and modern relays)")
+	flag.BoolVar(&ForceAppRelay, "app-relay", false, "force app relay dialect (2024+ devices: fresh BIND per realm, realm pooling off)")
 	flag.BoolVar(&ForceAppRelay, "ar", false, "force app relay dialect")
 	flag.BoolVar(&ForceRelay, "relay", false, "force UDP relay data path (skips direct STUN punch)")
 	flag.BoolVar(&ForceRelay, "r", false, "force UDP relay data path")
@@ -377,8 +377,8 @@ General:
                                   no tunnel
   --test-mtu                      run active Path MTU Discovery probe against
                                   Dahua cloud and print diagnostics
-  --app-relay, -ar                force app relay dialect (skips 0x17/0x19
-                                  token auth on modern devices / relays)
+  --app-relay, -ar                force app relay dialect (2024+ devices:
+                                  fresh BIND per realm, realm pooling off)
   --relay, -r                     force the UDP-relay data path (skip STUN punch)
   --race                          race application profiles (smartpss vs dmss)
                                   in parallel for fastest connection

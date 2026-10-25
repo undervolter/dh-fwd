@@ -1,24 +1,14 @@
 package core
 
-// relay_resilience.go —  relay-  
-//  easy4ip (live 2026-09-13: 177 alloc' → 52 , 52
-// start' → 0 , 176/178 lookup'    
-// ).  :
-//
-//  1.     /relay/agent —  
-//            .
-//  2.    per-host backoff  : ,  
-//     /online/relay, ;    
-//         .
-//  3.  «»-: bind'  ( ) ack',
-//     heartbeat' ,  DATA   —   .
-//      up-     
-//     zombieRelayTimeout =  ;  
-//     runWithRetries   - (forceAppRelay:  0x17/0x19
-//      data-,      2024+).
+// relay_resilience.go — resilience mechanisms for the UDP relay path:
+// 1. Dispatcher concurrency limiting via semaphore.
+// 2. Per-host backoff to skip unresponsive relay dispatchers.
+// 3. Zombie watchdog: detects when a relay path stops forwarding data back
+//    and triggers tunnel reconnection.
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -57,15 +47,16 @@ func isTransportDead(err error) bool {
 
 var errZombieRelay = errors.New("relay zombie: bind acks pass but no DATA comes back")
 
-// RelayAllocLimit —   /relay/agent   .
+// RelayAllocLimit bounds concurrent /relay/agent allocations.
 var RelayAllocLimit = 6
 
-//  relay-. Vars —   .
+// Relay timeouts and retries.
 var (
 	relayAgentAllocTimeout = 4 * time.Second
 	relayDispatchBase      = 3 * time.Second
 	relayDispatchMax       = 15 * time.Second
 	relayStartRetries      = 3
+	relayStartAuthRetries  = 3
 	relayStartRetransDelay = 1200 * time.Millisecond
 	zombieRelayTimeout     = 12 * time.Second
 	zombieScanEvery        = 3 * time.Second
@@ -81,7 +72,7 @@ func relayAllocSlot() chan struct{} {
 	return relayAllocSem
 }
 
-//  :  ,   /online/relay, + .
+// relayDispatchState tracks known relay dispatchers and backoff penalties.
 type relayDispatchState struct {
 	mu       sync.Mutex
 	known    []string
@@ -139,8 +130,7 @@ func (s *relayDispatchState) backoffLeft(hostport string) time.Duration {
 	return 0
 }
 
-// nextTo   :   ,   
-//      . "" —  .
+// nextTo returns an alternate dispatcher candidate.
 func (s *relayDispatchState) nextTo(current string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -156,10 +146,7 @@ func (s *relayDispatchState) nextTo(current string) string {
 	return ""
 }
 
-// allocRelayAgent —  (smartpss)  : 
-// , per-host backoff,     .
-//  ok=false,     —  ,
-// runWithRetries  .
+// allocRelayAgent requests a relay agent allocation from the cloud dispatcher.
 func (t *Tunnel) allocRelayAgent(mainRemote *UDP, dispatcher string) (host string, port int, token string, ok bool) {
 	relayAllocSlot()
 	select {
@@ -185,9 +172,8 @@ func (t *Tunnel) allocRelayAgent(mainRemote *UDP, dispatcher string) (host strin
 		}
 		if left := relayDispatch.backoffLeft(hp); left > 0 {
 			if i < len(candidates)-1 {
-				continue //   —   
+				continue
 			}
-			//   —   backoff ( )
 			if left > 2*time.Second {
 				left = 2 * time.Second
 			}
@@ -199,8 +185,6 @@ func (t *Tunnel) allocRelayAgent(mainRemote *UDP, dispatcher string) (host strin
 		}
 
 		mainRemote.SetRemote(parts[0], cport)
-		//    RELAY_READ_TIMEOUT:  
-		//     ,   —   15.
 		mainRemote.RequestEx("/relay/agent", "", true, false, reqOpts{})
 		res, err := mainRemote.Read(true, relayAgentAllocTimeout)
 		if err != nil || res == nil || res.Body["body/Token"] == "" {
@@ -220,25 +204,46 @@ func (t *Tunnel) allocRelayAgent(mainRemote *UDP, dispatcher string) (host strin
 	return "", 0, "", false
 }
 
-// startRelayAgent — /relay/start  :  
-//  start-.  send   
-// (  :  DH-,   ,
-//    ReadPTCP  ptcp sync) —   
-// .   :    .
+// startRelayAgent runs /relay/start on behalf of the client.
+// P2PDll parity:
+//   - Body carries Client = "<bindIP>:<lport>" (sub_18004D420) instead of literal ":0";
+//   - 200 finishes start; 401 re-authenticates with fresh crypto up to relayStartAuthRetries (3);
+//   - Other codes >=400 abort agent start;
+//   - Advertised <Time> budget is logged.
 func (t *Tunnel) startRelayAgent(mainRemote *UDP, agentHost string, agentPort int, agentToken string) {
 	mainRemote.SetRemote(agentHost, agentPort)
-	for i := 0; i < relayStartRetries; i++ {
-		mainRemote.RequestEx("/relay/start/"+agentToken, "<body><Client>:0</Client></body>", true, false, reqOpts{})
-		if _, err := mainRemote.Read(true, relayStartRetransDelay); err == nil {
+	body := fmt.Sprintf("<body><Client>%s:%d</Client></body>", mainRemote.bindIP, mainRemote.lport)
+	auth401 := 0
+	for i := 0; i < relayStartRetries+relayStartAuthRetries; i++ {
+		mainRemote.RequestEx("/relay/start/"+agentToken, body, true, false, reqOpts{})
+		res, err := mainRemote.Read(true, relayStartRetransDelay)
+		if err != nil || res == nil {
+			continue
+		}
+		switch {
+		case res.Code == 200:
+			if v := res.Body["body/Time"]; v != "" {
+				t.logf("relay agent session Time=%ss (keepalive budget)", v)
+			}
+			return
+		case res.Code == 401:
+			maybeUpdateTimeOffset(res, t.logf)
+			auth401++
+			if auth401 > relayStartAuthRetries {
+				t.logf("relay agent start: 401 auth fail over %d times — giving up", relayStartAuthRetries)
+				return
+			}
+			t.logf("relay agent start: 401 (WSSE rejected) — re-auth %d/%d with fresh crypto", auth401, relayStartAuthRetries)
+		default:
+			t.logf("relay agent start: unexpected code %d %s — giving up", res.Code, res.Status)
 			return
 		}
 	}
 }
 
-// zombieWatchdog   : up- , 
-// DATA-   zombieRelayTimeout — data path . 
-//  (runWithRetries ),   — 
-// -.
+// zombieWatchdog monitors data-path liveness on relay connections:
+// if local clients upload data but remote peer returns 0 bytes for zombieRelayTimeout,
+// marks the relay as a zombie and triggers tunnel reconnection.
 func (t *Tunnel) zombieWatchdog(done chan struct{}) {
 	defer t.readerWG.Done()
 	tick := time.NewTicker(zombieScanEvery)
@@ -293,4 +298,3 @@ func (t *Tunnel) zombieWatchdog(done chan struct{}) {
 		}
 	}
 }
-

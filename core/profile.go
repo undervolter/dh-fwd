@@ -3,7 +3,6 @@ package core
 import (
 	"crypto/rand"
 	"fmt"
-	"time"
 )
 
 // Application profiles: every stock Dahua client (SmartPSS, DMSS) speaks the
@@ -83,8 +82,10 @@ var smartpssProfile = &appProfile{
 	wsseUserKey: WSSE_USERKEY,
 	verbGet:     "DHGET",
 	verbPost:    "DHPOST",
-	// Legacy format: UTC stamped with a literal Z.
-	createdNow: func() string { return time.Now().UTC().Format("2006-01-02T15:04:05Z") },
+	// Legacy format: UTC stamped with a literal Z. The clock is the
+	// offset-corrected one (serverTimeOffset) — WSSE Created is what a
+	// skewed local clock breaks first (401 + ServerTime round-trip).
+	createdNow: func() string { return nowAdjusted().UTC().Format("2006-01-02T15:04:05Z") },
 	warmupPath: "/probe/p2psrv",
 	warmupAuth: true,
 	channelRetransmit: true,
@@ -105,7 +106,7 @@ var dmssProfile = &appProfile{
 	// offset. Matching the phone's exact +03:00 is NOT required — the capture
 	// evidence shows numeric offsets are accepted, so the container's
 	// +00:00 (or any local zone) is fine.
-	createdNow: func() string { return time.Now().Format("2006-01-02T15:04:05-07:00") },
+	createdNow: func() string { return nowAdjusted().Format("2006-01-02T15:04:05-07:00") },
 	toUType:    "Client/Dmss_Android",
 	version:    "6.7.15",
 	sversion:   "1.1.0",

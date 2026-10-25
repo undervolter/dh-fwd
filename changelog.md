@@ -4,7 +4,14 @@
  - [~] fixed: убрана ложная проверка версии 5.x как "2024+", ломавшая пул реалмов | fixed: removed false "2024+" version check that killed the realm pool
  - [~] fixed: корректная обработка опкода управления потоком 0x0e без спама в лог | fixed: silent handling of flow-control opcode 0x0e
  - [~] fixed: надёжный парсер ParsePTCPPayload по реверсу SmartPSS CProxySession (сняты лишние проверки padding) | fixed: robust PTCP payload parsing matching SmartPSS CProxySession
+ - [-] removed: удалена мифология фейковых токенов (0x17/0x19/0x1A) и искусственные задержки 15с при старте relay | removed: fake PTCP token handshake mythology and 15s artificial delays on relay channel start
+ - [+] parity: синхронизация времени с сервером Dahua (CTimeOffset / ServerTime 401) для точной подписи WSSE/DevAuth | parity: server time offset synchronization (CTimeOffset) for accurate WSSE signatures under clock skew
+ - [+] parity: корректный разрыв сессии на облачном сервере (/relay/unbind/<token>) при закрытии туннеля | parity: graceful cloud relay teardown via /relay/unbind API
+ - [+] parity: link-switch лестница (PAUSE 0x17 -> direct SYNC -> RESUME 0x19) при победе прямого STUN после старта relay | parity: link-switch ladder upon late STUN punch resolution
+ - [+] parity: парсер опций PTCP SYNC (MSS и Window Scale TLV) по реверсу CPhonyTcp::parseOptions | parity: PTCP SYNC options parser for MSS and Window Scale TLVs
+ - [~] fixed: устранена кодировка UTF-8/CP1251 (кракозябры) в комментариях ядра | fixed: cleaned up mojibake and encoding corruptions across core files
 ```
+
 
 [23.10.26] dh-fwd 0.1 (GitHub: v2.5)
 ```md

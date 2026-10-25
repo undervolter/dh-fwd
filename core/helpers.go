@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -41,6 +42,45 @@ var (
 	cseqLock sync.Mutex
 	cseq     uint32
 )
+
+// serverTimeOffset is local-minus-server clock skew in seconds, exactly
+// P2PDll's dword_1801B0EBC. Updated from ServerTime strings carried by
+// 401/403 responses ("Response 401 with ServerTime[%s]…", 0x18012D300);
+// parsed with the DLL's strptime literal "%Y-%m-%dT%H:%M:%S" (0x180130080).
+// Every auth timestamp (DevAuth CreateDate, WSSE Created) is stamped as
+// now - offset — CTimeOffset::updateOffset (sub_1800471A0) computes
+// offset = time64(NULL) - parsed(server) and logs changes beyond ±20 s.
+var serverTimeOffset atomic.Int64
+
+// nowAdjusted returns the offset-corrected wall clock: what the server
+// believes "now" is.
+func nowAdjusted() time.Time {
+	return time.Now().Add(-time.Duration(serverTimeOffset.Load()) * time.Second)
+}
+
+// updateServerTimeOffset mirrors CTimeOffset::updateOffset: parses one
+// ServerTime string ("2006-01-02T15:04:05", server-local), stores
+// local-server as the global offset and logs when it moved by more than
+// ±20 s. Returns false on an unparsable string (caller keeps the old
+// offset — the DLL returns 0 and keeps dword_1801B0EBC too).
+func updateServerTimeOffset(serverTime string, logf func(string, ...any)) bool {
+	t, err := time.ParseInLocation("2006-01-02T15:04:05", strings.TrimSpace(serverTime), time.Local)
+	if err != nil {
+		return false
+	}
+	off := time.Since(t).Round(time.Second)
+	secs := int64(off / time.Second)
+	old := serverTimeOffset.Load()
+	delta := secs - old
+	if delta > 20 || delta < -20 {
+		if logf == nil {
+			logf = writeLog
+		}
+		logf("time offset changed: %ds (was %ds) — server clock skew corrected", secs, old)
+	}
+	serverTimeOffset.Store(secs)
+	return true
+}
 
 // ---------------------------------------------------------------------------
 // Device auth (Type 1): master key derivation, AES-OFB address encryption,
@@ -99,8 +139,9 @@ func getDec(key []byte, nonce int, data string) string {
 
 // getAuth builds the DevAuth XML block: Base64(HMAC-SHA256(masterKey,
 // string(nonce) + string(unixNow) + payload)). Section 4.3 step 4.
+// unixNow is offset-corrected (CTimeOffset parity — see serverTimeOffset).
 func getAuth(username string, key []byte, nonce int, payload, randsalt string) string {
-	return getAuthAt(username, key, nonce, payload, randsalt, time.Now().Unix())
+	return getAuthAt(username, key, nonce, payload, randsalt, nowAdjusted().Unix())
 }
 
 // getAuthAt is getAuth with a fixed CreateDate — retransmissions keep the
@@ -767,6 +808,19 @@ func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
 				delete(u.rcvOoo, minSeq)
 				u.rcvNxt = minSeq + uint32(len(seg.Body))
 				u.ptcpRecv = u.rcvNxt
+
+				// Drain any contiguous segments following minSeq
+				for {
+					next, ok := u.rcvOoo[u.rcvNxt]
+					if !ok {
+						break
+					}
+					delete(u.rcvOoo, u.rcvNxt)
+					u.rcvNxt += uint32(len(next.Body))
+					u.ptcpRecv = u.rcvNxt
+					u.rcvReady = append(u.rcvReady, next)
+				}
+
 				u.ptcpMu.Unlock()
 				return seg, nil
 			}
@@ -975,6 +1029,49 @@ func GetInvertedBytes(data []byte) []byte {
 		out[i] = ^b
 	}
 	return out
+}
+
+// parsePTCPSyncBody validates a peer SYNC body the way P2PDll.dll does
+// (CPhonyTcp::parseOptions, sub_1800664F0): a flags byte, then TCP-style
+// TLV options — 0x00 end, 0x01 NOP, 0x02 MSS (a peer-specified MSS is
+// logged and IGNORED by the DLL), 0x03 window scale (length must be 1,
+// value = the shift byte). Options may end either via the 0x00 marker or
+// by exhausting the buffer. Returns the peer's window-scale shift (0 when
+// absent) and whether the body is a well-formed SYNC.
+//
+// dh-fwd's own SYNC body {0x00, 0x03, 0x01, 0x00} is flags 0x00 + a
+// window-scale option advertising shift 0 — valid by this parser.
+func parsePTCPSyncBody(body []byte) (wscaleShift byte, ok bool) {
+	if len(body) < 1 || body[0] != 0x00 {
+		return 0, false
+	}
+	i := 1
+	for i < len(body) {
+		switch body[i] {
+		case 0x00: // end of options
+			return wscaleShift, true
+		case 0x01: // NOP
+			i++
+		case 0x02: // MSS: full TLV, length includes the type and length bytes
+			if i+1 >= len(body) {
+				return 0, false
+			}
+			n := int(body[i+1])
+			if n < 2 || i+n > len(body) {
+				return 0, false
+			}
+			i += n
+		case 0x03: // window scale: exactly one value byte
+			if i+2 >= len(body) || body[i+1] != 1 {
+				return 0, false
+			}
+			wscaleShift = body[i+2]
+			i += 3
+		default:
+			return 0, false
+		}
+	}
+	return wscaleShift, true
 }
 
 // isPeerSupportLinkSwitch mirrors Dahua P2PDll.dll isPeerSupportLinkSwitchAndLocalP2P (0x18001D540):
