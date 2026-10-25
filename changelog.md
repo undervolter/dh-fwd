@@ -1,3 +1,11 @@
+[25.10.26] dh-fwd 0.1.1 (GitHub: v2.5.1)
+```md
+ - [~] fixed: устранён дедлок очереди ReadPTCP (rcvNxt/rcvOoo), блокировавший приём данных веб-морды в браузере | fixed: eliminated ReadPTCP reassembly deadlock causing browser hang on pending HTTP connections
+ - [~] fixed: убрана ложная проверка версии 5.x как "2024+", ломавшая пул реалмов | fixed: removed false "2024+" version check that killed the realm pool
+ - [~] fixed: корректная обработка опкода управления потоком 0x0e без спама в лог | fixed: silent handling of flow-control opcode 0x0e
+ - [~] fixed: надёжный парсер ParsePTCPPayload по реверсу SmartPSS CProxySession (сняты лишние проверки padding) | fixed: robust PTCP payload parsing matching SmartPSS CProxySession
+```
+
 [23.10.26] dh-fwd 0.1 (GitHub: v2.5)
 ```md
  - [~] Reworked network core
