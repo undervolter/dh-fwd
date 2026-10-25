@@ -31,6 +31,8 @@ Software for creating tunnels to a Dahua camera (by serial number), forwarding a
 > [!IMPORTANT]
 > If the connection to the camera goes through an intermediate server, the web panel might not work! This is dh-fwd's issue that will be fixed (hopefully) at 0.2
 
+## Known issues
+ - 80 and others ports not works with FW 5.x.x
 ## Build
 
 ```sh
