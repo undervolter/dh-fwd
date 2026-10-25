@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-var Version = "0.1"
+var Version = "0.2"
 
 const (
 	githubRepo    = "undervolter/dh-fwd"
