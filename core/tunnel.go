@@ -300,9 +300,10 @@ type Tunnel struct {
 	// pre-bound realm removes the BIND round-trip from the critical path.
 	// A keeper goroutine maintains the fixed level; in-flight binds are
 	// tracked so refills never overshoot.
-	poolMu     sync.Mutex
-	pools      map[int]*poolState
-	poolTarget int
+	poolMu         sync.Mutex
+	pools          map[int]*poolState
+	poolTarget     int
+	poolConfigured int
 	// poolExplicit is true when the level came from an explicit --pool flag:
 	// it wins over every automatic pool disable (noRelayAuth profiles,
 	// 2024+ forceAppRelay). The operator asked for it — honor it, even if
@@ -384,9 +385,10 @@ func newTunnel(serial string, prof *appProfile, dtype int, username, password, r
 		randsalt:     randsalt,
 		debug:        debug,
 		logRetries:   logRetries,
-		useTCP:       forceTCP,
-		poolTarget:   poolSize,
-		poolExplicit: poolExplicit,
+		useTCP:         forceTCP,
+		poolTarget:     poolSize,
+		poolConfigured: poolSize,
+		poolExplicit:   poolExplicit,
 		specs:        g.specs,
 		specIdx:      g.idxs,
 		reg:          reg,
@@ -428,6 +430,9 @@ func (t *Tunnel) reset() {
 	t.switchPauseAck = make(chan uint32, 1)
 	t.switchResumeAck = make(chan struct{}, 1)
 	t.pools = make(map[int]*poolState)
+	if !t.poolExplicit {
+		t.poolTarget = t.poolConfigured
+	}
 	if t.forceAppRelay && !t.poolExplicit {
 		t.poolTarget = 0
 	}
@@ -1114,6 +1119,11 @@ func (t *Tunnel) establish() error {
 		mainRemote.RequestPTCP(nil)
 		t.statusf(PhasePTCPHandshake, "relay path")
 		t.setPrimary(mainRemote)
+		if !t.poolExplicit {
+			t.logf("UDP relay forced — using on-demand BIND (SmartPSS parity, realm pool disabled to prevent packet drops)")
+			t.poolTarget = 0
+		}
+		time.Sleep(150 * time.Millisecond)
 		return nil
 	}
 
@@ -1344,6 +1354,11 @@ func (t *Tunnel) establish() error {
 				t.statusf(PhasePTCPHandshake, "relay path")
 				setPrimaryRelay := func(u *UDP) { t.setPrimary(u) }
 				setPrimaryRelay(mainRemote)
+				if !t.poolExplicit {
+					t.logf("Relay path active — using on-demand BIND (SmartPSS parity, realm pool disabled to prevent packet drops)")
+					t.poolTarget = 0
+				}
+				time.Sleep(150 * time.Millisecond)
 
 				// Relay won the race: stay on reliable Relay path.
 				go func() {
@@ -2172,6 +2187,9 @@ func (t *Tunnel) poolKeeper(done chan struct{}, remotePort int) {
 			spawn := t.poolTarget - len(st.queue) - st.inflight
 			if spawn < 0 {
 				spawn = 0
+			}
+			if spawn > 4 {
+				spawn = 4
 			}
 			t.poolMu.Unlock()
 			for i := 0; i < spawn; i++ {

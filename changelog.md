@@ -9,6 +9,8 @@
  - [+] parity: корректный разрыв сессии на облачном сервере (/relay/unbind/<token>) при закрытии туннеля | parity: graceful cloud relay teardown via /relay/unbind API
  - [+] parity: link-switch лестница (PAUSE 0x17 -> direct SYNC -> RESUME 0x19) при победе прямого STUN после старта relay | parity: link-switch ladder upon late STUN punch resolution
  - [+] parity: парсер опций PTCP SYNC (MSS и Window Scale TLV) по реверсу CPhonyTcp::parseOptions | parity: PTCP SYNC options parser for MSS and Window Scale TLVs
+ - [~] fixed: устранён relay zombie на первом запуске — автоматический переход на on-demand BIND на релейном пути (SmartPSS CProxyClientImpl parity) без протухания сессий на камере | fixed: eliminated first-attempt relay zombie via on-demand BIND on relay paths (SmartPSS CProxyClientImpl parity) preventing stale camera realms
+ - [~] fixed: ограничение спавна poolKeeper (макс. 4 горутины/тик) для предотвращения сетевых заторов | fixed: paced poolKeeper spawns (max 4 per tick) preventing UDP burst congestion
  - [~] fixed: устранена кодировка UTF-8/CP1251 (кракозябры) в комментариях ядра | fixed: cleaned up mojibake and encoding corruptions across core files
 ```
 
