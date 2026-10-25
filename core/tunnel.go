@@ -2464,8 +2464,8 @@ func (t *Tunnel) routePTCP(p *PTCP, src *UDP) {
 		}
 	case 0x13:
 		// Peer heartbeat — liveness is tracked via lastRecv.
-	case 0x0a:
-		// Flow-control / ping frame from device or relay agent; no-op.
+	case 0x0a, 0x0e:
+		// Flow-control / ping / buffer feedback frame from device or relay agent; no-op.
 	default:
 		primary := t.getPrimary()
 		var sincePrimary float64

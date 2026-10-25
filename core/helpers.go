@@ -834,7 +834,7 @@ func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
 		}
 
 		// In Dahua PTCP, only 0x10 frames carry stream data (PTCPPayload).
-		// All other frames (0x00 SYNC, 0x0a ping, 0x12 CONN/DISC, 0x13 heartbeat, 0x17 token)
+		// All other frames (0x00 SYNC, 0x0a/0x0e ping/flow, 0x12 CONN/DISC, 0x13 heartbeat, 0x17 token)
 		// are control frames that do not consume stream sequence space.
 		if len(ptcp.Body) == 0 || ptcp.Body[0] != 0x10 {
 			u.ptcpMu.Unlock()
