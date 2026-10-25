@@ -953,15 +953,6 @@ func (t *Tunnel) establish() error {
 		return fmt.Errorf("device response: code=%d %s", res.Code, res.Status)
 	}
 
-	if v := res.Body["body/version"]; isPeerSupportLinkSwitch(v) {
-		t.forceAppRelay = true
-		if t.poolExplicit {
-			t.logf("device version %s (2024+) detected — enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
-		} else {
-			t.logf("device version %s (2024+) detected — disabling realm pool and enabling app relay dialect", v)
-			t.poolTarget = 0
-		}
-	}
 
 	deviceLaddr := res.Body["body/LocalAddr"]
 	devicePub := res.Body["body/PubAddr"]
@@ -1503,15 +1494,7 @@ func (t *Tunnel) waitRelayChannelAck(mainRemote *UDP, agentHost string, agentPor
 				if t.debug {
 					t.logf("relay-channel ack received: code=%d status=%s", res.Code, res.Status)
 				}
-				if v := res.Body["body/version"]; isPeerSupportLinkSwitch(v) {
-					t.forceAppRelay = true
-					if t.poolExplicit {
-						t.logf("device version %s (2024+) detected - enabling app relay dialect, keeping explicit --pool=%d", v, t.poolTarget)
-					} else {
-						t.logf("device version %s (2024+) detected - disabling realm pool and enabling app relay dialect", v)
-						t.poolTarget = 0
-					}
-				}
+
 				return nil
 			}
 			// Error responses (401, 403, 404, etc.)
