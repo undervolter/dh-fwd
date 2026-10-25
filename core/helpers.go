@@ -739,11 +739,38 @@ func (u *UDP) ScheduleAck() {
 }
 
 // ReadPTCP waits for one PTCP frame and updates ack/rmid state.
+// Out-of-order data frames are buffered and delivered in strict contiguous sequence
+// (Dahua CPhonyTcp::processReceiver parity).
 func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
+	u.ptcpMu.Lock()
+	if len(u.rcvReady) > 0 {
+		ptcp := u.rcvReady[0]
+		u.rcvReady = u.rcvReady[1:]
+		u.ptcpMu.Unlock()
+		return ptcp, nil
+	}
+	u.ptcpMu.Unlock()
+
 	deadline := time.Now().Add(timeout)
 	for {
 		remTimeout := time.Until(deadline)
 		if remTimeout <= 0 {
+			u.ptcpMu.Lock()
+			if len(u.rcvOoo) > 0 {
+				var minSeq uint32 = 0xFFFFFFFF
+				for seq := range u.rcvOoo {
+					if seq < minSeq {
+						minSeq = seq
+					}
+				}
+				seg := u.rcvOoo[minSeq]
+				delete(u.rcvOoo, minSeq)
+				u.rcvNxt = minSeq + uint32(len(seg.Body))
+				u.ptcpRecv = u.rcvNxt
+				u.ptcpMu.Unlock()
+				return seg, nil
+			}
+			u.ptcpMu.Unlock()
 			return nil, context.DeadlineExceeded
 		}
 
@@ -753,7 +780,7 @@ func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
 		}
 		ptcp, err := ParsePTCP(data)
 		if err != nil {
-			return nil, err
+			continue
 		}
 		if len(ptcp.Body) > 0 {
 			bodyCopy := make([]byte, len(ptcp.Body))
@@ -817,11 +844,43 @@ func (u *UDP) ReadPTCP(timeout time.Duration) (*PTCP, error) {
 			}
 		}
 
-		if ptcp.Rlid+uint32(len(ptcp.Body)) > u.ptcpRecv {
-			u.ptcpRecv = ptcp.Rlid + uint32(len(ptcp.Body))
+		// In Dahua CPhonyTcp, every segment with length > 0 occupies sequence space
+		if len(ptcp.Body) == 0 {
+			u.ptcpMu.Unlock()
+			return ptcp, nil
 		}
+
+		if ptcp.Rlid == u.rcvNxt {
+			u.rcvNxt += uint32(len(ptcp.Body))
+			u.ptcpRecv = u.rcvNxt
+
+			for {
+				next, ok := u.rcvOoo[u.rcvNxt]
+				if !ok {
+					break
+				}
+				delete(u.rcvOoo, u.rcvNxt)
+				u.rcvNxt += uint32(len(next.Body))
+				u.ptcpRecv = u.rcvNxt
+				u.rcvReady = append(u.rcvReady, next)
+			}
+			u.ptcpMu.Unlock()
+			return ptcp, nil
+		}
+
+		if ptcp.Rlid > u.rcvNxt {
+			if len(u.rcvOoo) < 128 {
+				u.rcvOoo[ptcp.Rlid] = ptcp
+			}
+			u.ptcpMu.Unlock()
+			u.RequestPTCP(nil)
+			continue
+		}
+
+		// ptcp.Rlid < u.rcvNxt: duplicate or retransmitted segment already consumed
 		u.ptcpMu.Unlock()
-		return ptcp, nil
+		u.RequestPTCP(nil)
+		continue
 	}
 }
 
