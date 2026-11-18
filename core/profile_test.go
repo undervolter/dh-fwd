@@ -36,6 +36,15 @@ func TestProfileByName(t *testing.T) {
 	}{
 		{"smartpss", "smartpss"},
 		{"dmss", "dmss"},
+		{"kvmsprolite", "kvmsprolite"},
+		{"kvms", "kvmsprolite"},
+		{"instaon", "kvmsprolite"},
+		{"instaoncloud", "kvmsprolite"},
+		{"kvmsprolite-ctc", "kvmsprolite-ctc"},
+		{"kvms-ctc", "kvmsprolite-ctc"},
+		{"instaon-ctc", "kvmsprolite-ctc"},
+		{"gcmob", "gcmob"},
+		{"gcmob-ctc", "gcmob-ctc"},
 		{"", ""},
 		{"bogus", ""},
 		{"DMSS", ""},
@@ -91,6 +100,50 @@ func TestProfileSelection(t *testing.T) {
 			appHeaderOrder: true,
 			randomCSeq:     true,
 		},
+		{
+			prof: kvmsProfile, mainServer: "instaonserver.com",
+			wsseUser: "DuvCSF0EJcNIELdlJsgjXoXhh7m_kplc",
+			verbGet:  "NFGET", verbPost: "NFPOST",
+			toUType: "Client/KVMSProLite_Win", version: "6.7.15", sversion: "1.1.0",
+			warmupPath: "/online/stun", warmupAuth: false,
+			autoSalt: true,
+
+			appHeaderOrder: true,
+			randomCSeq:     true,
+		},
+		{
+			prof: kvmsCtcProfile, mainServer: "instaonserverctc.com",
+			wsseUser: "dS8dT3mS0uF4mX1fO3kA0kR5xB_cpcbc",
+			verbGet:  "NFGET", verbPost: "NFPOST",
+			toUType: "Client/KVMSProLite_Win", version: "6.7.15", sversion: "1.1.0",
+			warmupPath: "/online/stun", warmupAuth: false,
+			autoSalt: true,
+
+			appHeaderOrder: true,
+			randomCSeq:     true,
+		},
+		{
+			prof: gcmobProfile, mainServer: "instaonserver.com",
+			wsseUser: "89d61b61dc9a69fdcc03e4ff3a3be2f5",
+			verbGet:  "NFGET", verbPost: "NFPOST",
+			toUType: "Client/gCMOB_Android", version: "6.7.15", sversion: "1.1.0",
+			warmupPath: "/online/stun", warmupAuth: false,
+			autoSalt: true,
+
+			appHeaderOrder: true,
+			randomCSeq:     true,
+		},
+		{
+			prof: gcmobCtcProfile, mainServer: "instaonserverctc.com",
+			wsseUser: "zH4gW1gQ6eZ1bT1sH9yP6fR2f_cbmbap",
+			verbGet:  "NFGET", verbPost: "NFPOST",
+			toUType: "Client/gCMOB_Android", version: "6.7.15", sversion: "1.1.0",
+			warmupPath: "/online/stun", warmupAuth: false,
+			autoSalt: true,
+
+			appHeaderOrder: true,
+			randomCSeq:     true,
+		},
 	}
 	for _, tc := range tests {
 		p := tc.prof
@@ -100,6 +153,37 @@ func TestProfileSelection(t *testing.T) {
 			p.warmupPath != tc.warmupPath || p.warmupAuth != tc.warmupAuth || p.autoSalt != tc.autoSalt ||
 			p.appHeaderOrder != tc.appHeaderOrder || p.randomCSeq != tc.randomCSeq {
 			t.Fatalf("%s profile drift: %+v", p.name, p)
+		}
+	}
+}
+
+func TestDisplayName(t *testing.T) {
+	for _, tc := range []struct {
+		prof *appProfile
+		want string
+	}{
+		{smartpssProfile, "SmartPSS"},
+		{dmssProfile, "DMSS"},
+		{kvmsProfile, "KVMS Pro Lite"},
+		{kvmsCtcProfile, "KVMS Pro Lite (CTC)"},
+		{gcmobProfile, "gCMOB"},
+		{gcmobCtcProfile, "gCMOB (CTC)"},
+	} {
+		if got := tc.prof.displayName(); got != tc.want {
+			t.Fatalf("%s displayName = %q, want %q", tc.prof.name, got, tc.want)
+		}
+	}
+}
+
+func TestProfileFallbackOrder(t *testing.T) {
+	order := profileFallbackOrder()
+	expected := []string{"smartpss", "dmss", "kvmsprolite", "gcmob", "kvmsprolite-ctc", "gcmob-ctc"}
+	if len(order) != len(expected) {
+		t.Fatalf("profileFallbackOrder len = %d, want %d", len(order), len(expected))
+	}
+	for i, name := range expected {
+		if order[i].name != name {
+			t.Fatalf("profileFallbackOrder[%d] = %q, want %q", i, order[i].name, name)
 		}
 	}
 }

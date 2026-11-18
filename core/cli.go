@@ -237,7 +237,7 @@ func Execute() {
 	flag.BoolVar(&ForceAppRelay, "ar", false, "force app relay dialect")
 	flag.BoolVar(&ForceRelay, "relay", false, "force UDP relay data path (skips direct STUN punch)")
 	flag.BoolVar(&ForceRelay, "r", false, "force UDP relay data path")
-	flag.StringVar(&appName, "app", "smartpss", "application profile: smartpss (default) or dmss — picks the cloud host, app credentials and request dialect (dmss for devices bound via the DMSS app)")
+	flag.StringVar(&appName, "app", "smartpss", "application profile: smartpss (default), dmss, kvmsprolite (or kvms/instaon), gcmob, or -ctc variants — picks the cloud host, app credentials and request dialect")
 	var autoYes bool
 	flag.BoolVar(&autoYes, "y", false, "skip confirmation prompts")
 	flag.BoolVar(&autoYes, "yes", false, "skip confirmation prompts")
@@ -380,8 +380,8 @@ General:
   --app-relay, -ar                force app relay dialect (2024+ devices:
                                   fresh BIND per realm, realm pooling off)
   --relay, -r                     force the UDP-relay data path (skip STUN punch)
-  --race                          race application profiles (smartpss vs dmss)
-                                  in parallel for fastest connection
+  --race                          race application profiles in parallel
+                                  for fastest connection
   --tcp-relay, -R                 force the TCP-relay data path (TOU over TCP)
   --mtu <bytes>                   network MTU override (default: auto-detect
                                   from active interface, max 1280)
@@ -392,10 +392,10 @@ General:
                                   an explicit value wins over the
                                   automatic pool disable on 2024+
                                   devices / dmss profile)
-  --app <smartpss|dmss>           application profile (default smartpss):
-                                  cloud host + app credentials + request
-                                  dialect — dmss for devices bound through
-                                  the DMSS app (Dolynk cloud)
+  --app <profile>                 application profile (default smartpss):
+                                  smartpss, dmss, kvmsprolite, gcmob,
+                                  or -ctc variants — picks cloud host,
+                                  app credentials and request dialect
 
 Device auth:
   --creds, -c <user:pass> credentials in format username:password (sets --type 1)
