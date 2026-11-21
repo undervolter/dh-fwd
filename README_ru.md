@@ -50,6 +50,7 @@ go build .
 | `--type` | `-t` | Тип устройства: `0` = без авторизации (по умолчанию), `1` = с авторизацией |
 | `--username` | `-u` | Имя пользователя |
 | `--password` | `-P` | Пароль |
+| `--app <profile>` | `-` | Выбор профиля (`smartpss`, `dmss`, `kvmsprolite`, `gcmob` или `-ctc`) |
 | `--relay` | `-r` | Принудительное использование промежуточных серверов |
 | `--tcp-relay` | `-R` | Принудительный перевод в TCP-relay |
 | `--smartpss`, `--smart-pss` | `-2` | Форвардит 37777 и 80 одновременно |
@@ -60,8 +61,12 @@ go build .
 `--help` / `-h` выводит список всех доступных команд.
 
 ### Что за профили?
-Так как у Dahua разные сервера (в smartpss он easy4ipcloud, а в dmss - dolynkcloud) в софт был добавлен выбор профилей. 
-Профиль smartpss нужно использовать если вы регали камеру через SmartPSS, а dmss - если регали через DMSS. В противном случае вы получите 404 на одном из серверов
+Dahua и её OEM-экосистемы используют разные облачные серверы и встроенные учетные данные:
+- **SmartPSS** (`--app smartpss`, по умолчанию): Dahua Easy4IP Cloud (`www.easy4ipcloud.com:8800`).
+- **DMSS** (`--app dmss`): Dahua Dolynk Cloud (`p2p.dolynkcloud.com:8800`).
+- **CP Plus / InstaOn Cloud** (`--app kvmsprolite` или `--app gcmob`): Серверы CP Plus InstaOn (`instaonserver.com:8800`) с клиентами KVMS Pro Lite и gCMOB Android. Алиасы: `kvms`, `instaon`, `instaoncloud`. Для вторичных серверов доступны варианты `-ctc` (`--app kvmsprolite-ctc`, `--app gcmob-ctc`).
+
+Если `--app` не указан, `dh-fwd` автоматически ищет устройство перебором (SmartPSS → DMSS → KVMS Pro Lite → gCMOB → CTC) или параллельной гонкой с флагом `--race`.
 
 ### Как указывать порты (`--port`)
 

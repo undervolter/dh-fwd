@@ -36,6 +36,22 @@ func TestWSSEDigestGolden(t *testing.T) {
 			key:    WSSE_USERKEY,
 			want:   "2+go9D1pKW5ykn3ePUMZkhMmITo=",
 		},
+		{
+			name:   "kvmsprolite capture",
+			nonce:  "-1024243796",
+			creatd: "2026-11-18T22:17:41+05:30",
+			user:   KVMS_WSSE_USERNAME,
+			key:    KVMS_WSSE_USERKEY,
+			want:   "uo1krIyCADVZPr5ncY/qu1vMFjw=",
+		},
+		{
+			name:   "kvmsprolite-ctc capture",
+			nonce:  "-328519825",
+			creatd: "2026-11-18T22:17:45+05:30",
+			user:   KVMS_CTC_WSSE_USERNAME,
+			key:    KVMS_CTC_WSSE_USERKEY,
+			want:   "CRYtxd/C3U0Vy81a+KsbrALknZ0=",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -50,7 +66,7 @@ func TestWSSEDigestGolden(t *testing.T) {
 // the documented formula and the profile's own pair — this is what gates
 // serial→device resolution on the cloud.
 func TestBuildDHRequestDigestMatchesHeader(t *testing.T) {
-	for _, prof := range []*appProfile{smartpssProfile, dmssProfile} {
+	for _, prof := range []*appProfile{smartpssProfile, dmssProfile, kvmsProfile, kvmsCtcProfile, gcmobProfile, gcmobCtcProfile} {
 		req := string(buildDHRequest(prof.verbGet, "/online/p2psrv/SN", "", true, 1, prof, "", false))
 		user := regexp.MustCompile(`Username="([^"]+)"`).FindStringSubmatch(req)
 		digest := regexp.MustCompile(`PasswordDigest="([^"]+)"`).FindStringSubmatch(req)

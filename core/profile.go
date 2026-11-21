@@ -126,6 +126,138 @@ var dmssProfile = &appProfile{
 	warmupAuth: false, // stun carries only X-ToUType — no auth, no version headers
 }
 
+const (
+	INSTAON_MAIN_SERVER    = "instaonserver.com"
+	INSTAON_CTC_SERVER     = "instaonserverctc.com"
+	INSTAON_PORT           = 8800
+
+	// KVMS Pro Lite Windows client pairs
+	KVMS_WSSE_USERNAME     = "DuvCSF0EJcNIELdlJsgjXoXhh7m_kplc"
+	KVMS_WSSE_USERKEY      = "CD3zmkztC63QH3NomRczYTB9lv7KXEuo"
+
+	KVMS_CTC_WSSE_USERNAME = "dS8dT3mS0uF4mX1fO3kA0kR5xB_cpcbc"
+	KVMS_CTC_WSSE_USERKEY  = "fG6uM4eV9vS2dG3jU5aH7lZ7rU9dO9bK"
+
+	// gCMOB Android client pairs
+	GCMOB_WSSE_USERNAME     = "89d61b61dc9a69fdcc03e4ff3a3be2f5"
+	GCMOB_WSSE_USERKEY      = "993c7d7c95542c684c30ff9a9b831249"
+
+	GCMOB_CTC_WSSE_USERNAME = "zH4gW1gQ6eZ1bT1sH9yP6fR2f_cbmbap"
+	GCMOB_CTC_WSSE_USERKEY  = "dN2cQ9gV2qU0iR3uG0wM8oI9sK0hT9mQ"
+)
+
+var kvmsProfile = &appProfile{
+	name:        "kvmsprolite",
+	mainServer:  INSTAON_MAIN_SERVER,
+	mainPort:    INSTAON_PORT,
+	wsseUser:    KVMS_WSSE_USERNAME,
+	wsseUserKey: KVMS_WSSE_USERKEY,
+	verbGet:     "NFGET",
+	verbPost:    "NFPOST",
+	createdNow:  func() string { return nowAdjusted().Format("2006-01-02T15:04:05-07:00") },
+	toUType:     "Client/KVMSProLite_Win",
+	version:     "6.7.15",
+	sversion:    "1.1.0",
+
+	pcsRequestID:       true,
+	extendedBody:       true,
+	channelRetransmit:  true,
+	localChannel:       true,
+	autoSalt:           true,
+	noRelayAuth:        true,
+	relayAgentOptional: true,
+
+	appHeaderOrder: true,
+	randomCSeq:     true,
+
+	warmupPath: "/online/stun",
+	warmupAuth: false,
+}
+
+var kvmsCtcProfile = &appProfile{
+	name:        "kvmsprolite-ctc",
+	mainServer:  INSTAON_CTC_SERVER,
+	mainPort:    INSTAON_PORT,
+	wsseUser:    KVMS_CTC_WSSE_USERNAME,
+	wsseUserKey: KVMS_CTC_WSSE_USERKEY,
+	verbGet:     "NFGET",
+	verbPost:    "NFPOST",
+	createdNow:  func() string { return nowAdjusted().Format("2006-01-02T15:04:05-07:00") },
+	toUType:     "Client/KVMSProLite_Win",
+	version:     "6.7.15",
+	sversion:    "1.1.0",
+
+	pcsRequestID:       true,
+	extendedBody:       true,
+	channelRetransmit:  true,
+	localChannel:       true,
+	autoSalt:           true,
+	noRelayAuth:        true,
+	relayAgentOptional: true,
+
+	appHeaderOrder: true,
+	randomCSeq:     true,
+
+	warmupPath: "/online/stun",
+	warmupAuth: false,
+}
+
+var gcmobProfile = &appProfile{
+	name:        "gcmob",
+	mainServer:  INSTAON_MAIN_SERVER,
+	mainPort:    INSTAON_PORT,
+	wsseUser:    GCMOB_WSSE_USERNAME,
+	wsseUserKey: GCMOB_WSSE_USERKEY,
+	verbGet:     "NFGET",
+	verbPost:    "NFPOST",
+	createdNow:  func() string { return nowAdjusted().Format("2006-01-02T15:04:05-07:00") },
+	toUType:     "Client/gCMOB_Android",
+	version:     "6.7.15",
+	sversion:    "1.1.0",
+
+	pcsRequestID:       true,
+	extendedBody:       true,
+	channelRetransmit:  true,
+	localChannel:       true,
+	autoSalt:           true,
+	noRelayAuth:        true,
+	relayAgentOptional: true,
+
+	appHeaderOrder: true,
+	randomCSeq:     true,
+
+	warmupPath: "/online/stun",
+	warmupAuth: false,
+}
+
+var gcmobCtcProfile = &appProfile{
+	name:        "gcmob-ctc",
+	mainServer:  INSTAON_CTC_SERVER,
+	mainPort:    INSTAON_PORT,
+	wsseUser:    GCMOB_CTC_WSSE_USERNAME,
+	wsseUserKey: GCMOB_CTC_WSSE_USERKEY,
+	verbGet:     "NFGET",
+	verbPost:    "NFPOST",
+	createdNow:  func() string { return nowAdjusted().Format("2006-01-02T15:04:05-07:00") },
+	toUType:     "Client/gCMOB_Android",
+	version:     "6.7.15",
+	sversion:    "1.1.0",
+
+	pcsRequestID:       true,
+	extendedBody:       true,
+	channelRetransmit:  true,
+	localChannel:       true,
+	autoSalt:           true,
+	noRelayAuth:        true,
+	relayAgentOptional: true,
+
+	appHeaderOrder: true,
+	randomCSeq:     true,
+
+	warmupPath: "/online/stun",
+	warmupAuth: false,
+}
+
 // profileByName resolves the --app flag value.
 func profileByName(name string) (*appProfile, error) {
 	switch name {
@@ -133,8 +265,16 @@ func profileByName(name string) (*appProfile, error) {
 		return smartpssProfile, nil
 	case "dmss":
 		return dmssProfile, nil
+	case "kvmsprolite", "kvms", "instaon", "instaoncloud":
+		return kvmsProfile, nil
+	case "kvmsprolite-ctc", "kvms-ctc", "instaon-ctc", "instaoncloud-ctc":
+		return kvmsCtcProfile, nil
+	case "gcmob":
+		return gcmobProfile, nil
+	case "gcmob-ctc":
+		return gcmobCtcProfile, nil
 	}
-	return nil, fmt.Errorf("unknown app profile %q (want smartpss or dmss)", name)
+	return nil, fmt.Errorf("unknown app profile %q (want smartpss, dmss, kvmsprolite, gcmob, or -ctc variants)", name)
 }
 
 // displayName returns a human-readable label for UI output.
@@ -144,15 +284,23 @@ func (p *appProfile) displayName() string {
 		return "SmartPSS"
 	case "dmss":
 		return "DMSS"
+	case "kvmsprolite":
+		return "KVMS Pro Lite"
+	case "kvmsprolite-ctc":
+		return "KVMS Pro Lite (CTC)"
+	case "gcmob":
+		return "gCMOB"
+	case "gcmob-ctc":
+		return "gCMOB (CTC)"
 	}
 	return p.name
 }
 
 // profileFallbackOrder returns the automatic profile discovery sequence:
-// smartpss first (easy4ip cloud), then dmss (Dolynk cloud). Used when the
-// operator does not pin a specific --app profile.
+// smartpss first (easy4ip cloud), then dmss (Dolynk cloud), then kvmsprolite
+// and gcmob (InstaOn cloud).
 func profileFallbackOrder() []*appProfile {
-	return []*appProfile{smartpssProfile, dmssProfile}
+	return []*appProfile{smartpssProfile, dmssProfile, kvmsProfile, gcmobProfile, kvmsCtcProfile, gcmobCtcProfile}
 }
 
 // randomHex returns n crypto-random bytes as 2n lowercase hex chars — the
